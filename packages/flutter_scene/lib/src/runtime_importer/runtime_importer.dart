@@ -8,6 +8,7 @@ import 'package:flutter_scene/src/importer/gltf_light_units.dart';
 import '../animation.dart';
 import '../components/component.dart';
 import '../components/directional_light_component.dart';
+import '../components/gltf_source_component.dart';
 import '../components/materials_variants_component.dart';
 import '../components/point_light_component.dart';
 import '../components/spot_light_component.dart';
@@ -256,6 +257,7 @@ void _populateNode({
   required List<MaterialsVariantBinding> variantBindings,
 }) {
   engineNode.name = resolveGltfNodeName(gltfNode.name, index);
+  engineNode.addComponent(GltfSourceComponent(index));
   const coordinatePolicy = GltfCoordinatePolicy.runtimeBoundary;
   final matrix = gltfNode.matrix;
   if (matrix != null) {
@@ -297,6 +299,9 @@ void _populateNode({
           ? packedVariants.unskinned
           : packedVariants.skinned;
       final geometry = geometryFromPacked(packedPrimitive);
+      if (geometry.morphTargets != null && gltfMesh.weights.isNotEmpty) {
+        geometry.morphTargets!.setWeights(gltfMesh.weights);
+      }
       final material = p.material != null
           ? materials[p.material!]
           : UnlitMaterial();

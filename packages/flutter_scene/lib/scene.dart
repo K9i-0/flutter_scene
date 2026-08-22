@@ -28,7 +28,13 @@ export 'src/animation.dart' show Animation, AnimationClip, AnimationPlayer;
 export 'src/geometry/billboard_geometry.dart'
     show BillboardFacing, BillboardGeometry;
 export 'src/geometry/geometry.dart'
-    show Geometry, GeometryBufferArena, SkinnedGeometry, UnskinnedGeometry;
+    show
+        Geometry,
+        GeometryBufferArena,
+        MorphTarget,
+        MorphTargetController,
+        SkinnedGeometry,
+        UnskinnedGeometry;
 export 'src/geometry/line_segments_geometry.dart' show LineSegmentsGeometry;
 export 'src/geometry/vertex_layout.dart'
     show
@@ -133,6 +139,7 @@ export 'src/components/directional_light_component.dart'
     show DirectionalLightComponent;
 export 'src/components/environment_volume_component.dart'
     show EnvironmentVolumeComponent, EnvironmentVolumeShape;
+export 'src/components/gltf_source_component.dart' show GltfSourceComponent;
 export 'src/components/instanced_mesh_component.dart'
     show InstancedMeshComponent;
 export 'src/components/lod_component.dart' show LodComponent;

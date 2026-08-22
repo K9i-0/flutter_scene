@@ -126,9 +126,10 @@ String resolveGltfNodeName(String? gltfName, int index) {
 }
 
 class GltfMesh {
-  GltfMesh({this.name, this.primitives = const []});
+  GltfMesh({this.name, this.primitives = const [], this.weights = const []});
   final String? name;
   final List<GltfMeshPrimitive> primitives;
+  final List<double> weights;
 }
 
 class GltfMeshPrimitive {
@@ -138,6 +139,7 @@ class GltfMeshPrimitive {
     this.material,
     this.mode = 4,
     this.variantMappings = const {},
+    this.targets = const [],
   });
 
   /// Maps glTF attribute names ('POSITION', 'NORMAL', 'TEXCOORD_0',
@@ -153,6 +155,9 @@ class GltfMeshPrimitive {
   /// [GltfDocument.materialsVariants]) to material index. Empty when the
   /// primitive declares no mappings; [material] stays the default.
   final Map<int, int> variantMappings;
+
+  /// Morph target attribute maps in glTF target order.
+  final List<Map<String, int>> targets;
 }
 
 /// Component types from glTF spec section 5.1.1.
@@ -209,6 +214,7 @@ class GltfAccessor {
     this.normalized = false,
     this.min,
     this.max,
+    this.sparse,
   });
 
   final GltfComponentType componentType;
@@ -223,6 +229,41 @@ class GltfAccessor {
   /// to skip a vertex scan when computing bounding volumes.
   final List<double>? min;
   final List<double>? max;
+  final GltfAccessorSparse? sparse;
+}
+
+class GltfAccessorSparse {
+  const GltfAccessorSparse({
+    required this.count,
+    required this.indices,
+    required this.values,
+  });
+
+  final int count;
+  final GltfAccessorSparseIndices indices;
+  final GltfAccessorSparseValues values;
+}
+
+class GltfAccessorSparseIndices {
+  const GltfAccessorSparseIndices({
+    required this.bufferView,
+    required this.componentType,
+    this.byteOffset = 0,
+  });
+
+  final int bufferView;
+  final GltfComponentType componentType;
+  final int byteOffset;
+}
+
+class GltfAccessorSparseValues {
+  const GltfAccessorSparseValues({
+    required this.bufferView,
+    this.byteOffset = 0,
+  });
+
+  final int bufferView;
+  final int byteOffset;
 }
 
 class GltfBufferView {

@@ -17,12 +17,38 @@ Geometry geometryFromPacked(PackedPrimitive packed) {
   final Geometry geometry = packed.isSkinned
       ? SkinnedGeometry()
       : UnskinnedGeometry();
-  geometry.uploadVertexData(
-    ByteData.sublistView(packed.vertexBytes),
-    packed.vertexCount,
-    ByteData.sublistView(packed.indexBytes),
-    indexType: packed.indices32Bit ? gpu.IndexType.int32 : gpu.IndexType.int16,
-  );
+  final vertexData = ByteData.sublistView(packed.vertexBytes);
+  final indexData = ByteData.sublistView(packed.indexBytes);
+  final indexType = packed.indices32Bit
+      ? gpu.IndexType.int32
+      : gpu.IndexType.int16;
+  if (packed.morphTargets.isEmpty) {
+    geometry.uploadVertexData(
+      vertexData,
+      packed.vertexCount,
+      indexData,
+      indexType: indexType,
+    );
+  } else {
+    geometry.uploadMutableVertexData(
+      vertexData,
+      packed.vertexCount,
+      indexData,
+      indexType: indexType,
+    );
+    geometry.morphTargets = MorphTargetController(
+      geometry: geometry,
+      baseVertices: vertexData,
+      vertexCount: packed.vertexCount,
+      targets: [
+        for (final target in packed.morphTargets)
+          MorphTarget(positions: target.positions, normals: target.normals),
+      ],
+    );
+    // Morph extents are not baked yet; unknown bounds keeps the geometry on
+    // the always-visible culling path and avoids clipping expressions.
+    geometry.setLocalBounds(null, null);
+  }
   geometry.sourceWindingFlipped = packed.sourceWindingFlipped;
   return geometry;
 }

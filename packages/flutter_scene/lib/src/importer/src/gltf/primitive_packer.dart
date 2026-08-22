@@ -22,6 +22,7 @@ class PackedPrimitive {
     required this.indices32Bit,
     required this.isSkinned,
     required this.sourceWindingFlipped,
+    this.morphTargets = const [],
   });
 
   /// Packed vertex buffer in the engine's vertex layout (72 bytes per
@@ -45,6 +46,17 @@ class PackedPrimitive {
 
   /// Whether the packed source convention reverses native winding.
   final bool sourceWindingFlipped;
+
+  /// Morph target position/normal deltas, expanded to the packed vertex set.
+  final List<PackedMorphTarget> morphTargets;
+}
+
+/// CPU morph deltas paired with a [PackedPrimitive].
+class PackedMorphTarget {
+  const PackedMorphTarget({required this.positions, required this.normals});
+
+  final Float32List positions;
+  final Float32List normals;
 }
 
 /// Packs a glTF mesh primitive into the engine's vertex/index layout.
@@ -90,8 +102,9 @@ PackedPrimitive packGltfPrimitive({
     final accessor = accessors[primitive.indices!];
     indexList = readAccessorAsUint32(
       accessor,
-      bufferViews[accessor.bufferView!],
+      accessor.bufferView == null ? null : bufferViews[accessor.bufferView!],
       bufferData,
+      allBufferViews: bufferViews,
     );
     indices32Bit = accessor.componentType == GltfComponentType.unsignedInt;
   } else {
@@ -273,6 +286,34 @@ PackedPrimitive packGltfPrimitive({
     }
   }
 
+  final morphTargets = <PackedMorphTarget>[];
+  for (final target in primitive.targets) {
+    final sourcePositions = target['POSITION'] == null
+        ? Float32List(vertexCount * 3)
+        : _readVec3(target['POSITION']!, accessors, bufferViews, bufferData);
+    final sourceNormals = target['NORMAL'] == null
+        ? Float32List(vertexCount * 3)
+        : _readVec3(target['NORMAL']!, accessors, bufferViews, bufferData);
+    final targetPositions = Float32List(outVertexCount * 3);
+    final targetNormals = Float32List(outVertexCount * 3);
+    for (var k = 0; k < outVertexCount; k++) {
+      final source = srcOf[k];
+      for (var component = 0; component < 3; component++) {
+        targetPositions[k * 3 + component] =
+            sourcePositions[source * 3 + component];
+        targetNormals[k * 3 + component] =
+            sourceNormals[source * 3 + component];
+      }
+      if (coordinatePolicy.bakesNative) {
+        targetPositions[k * 3 + 2] = -targetPositions[k * 3 + 2];
+        targetNormals[k * 3 + 2] = -targetNormals[k * 3 + 2];
+      }
+    }
+    morphTargets.add(
+      PackedMorphTarget(positions: targetPositions, normals: targetNormals),
+    );
+  }
+
   // The engine wants 16- or 32-bit indices. Pass 32-bit through; narrow
   // everything else to 16-bit.
   final Uint8List indexBytes;
@@ -300,6 +341,7 @@ PackedPrimitive packGltfPrimitive({
     indices32Bit: outIndices32Bit,
     isSkinned: hasJoints,
     sourceWindingFlipped: coordinatePolicy.sourceWindingFlipped,
+    morphTargets: morphTargets,
   );
 }
 
@@ -312,8 +354,9 @@ Float32List _readVec3(
   final accessor = accessors[idx];
   return readAccessorAsFloat32(
     accessor,
-    bufferViews[accessor.bufferView!],
+    accessor.bufferView == null ? null : bufferViews[accessor.bufferView!],
     bufferData,
+    allBufferViews: bufferViews,
   );
 }
 
@@ -326,8 +369,9 @@ Float32List _readVec4(
   final accessor = accessors[idx];
   return readAccessorAsFloat32(
     accessor,
-    bufferViews[accessor.bufferView!],
+    accessor.bufferView == null ? null : bufferViews[accessor.bufferView!],
     bufferData,
+    allBufferViews: bufferViews,
   );
 }
 
@@ -357,8 +401,9 @@ Float32List _readOptionalVec2(
   final accessor = accessors[idx];
   return readAccessorAsFloat32(
     accessor,
-    bufferViews[accessor.bufferView!],
+    accessor.bufferView == null ? null : bufferViews[accessor.bufferView!],
     bufferData,
+    allBufferViews: bufferViews,
   );
 }
 
@@ -385,8 +430,9 @@ Float32List _readOptionalColor(
   final accessor = accessors[idx];
   final raw = readAccessorAsFloat32(
     accessor,
-    bufferViews[accessor.bufferView!],
+    accessor.bufferView == null ? null : bufferViews[accessor.bufferView!],
     bufferData,
+    allBufferViews: bufferViews,
   );
   if (accessor.type == GltfAccessorType.vec4) return raw;
   // Promote vec3 colors to vec4 with alpha=1.

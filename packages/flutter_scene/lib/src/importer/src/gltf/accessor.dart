@@ -9,44 +9,34 @@ import 'types.dart';
 /// [bufferData] is the GLB binary chunk (or the resolved external buffer).
 Float32List readAccessorAsFloat32(
   GltfAccessor accessor,
-  GltfBufferView bufferView,
-  Uint8List bufferData,
-) {
+  GltfBufferView? bufferView,
+  Uint8List bufferData, {
+  List<GltfBufferView>? allBufferViews,
+}) {
   final componentCount = accessor.type.componentCount;
   final totalComponents = accessor.count * componentCount;
   final out = Float32List(totalComponents);
 
-  final stride =
-      bufferView.byteStride ?? (componentCount * accessor.componentType.bytes);
-  final start = bufferView.byteOffset + accessor.byteOffset;
   final view = ByteData.sublistView(bufferData);
 
-  for (int i = 0; i < accessor.count; i++) {
-    final base = start + i * stride;
-    for (int c = 0; c < componentCount; c++) {
-      final off = base + c * accessor.componentType.bytes;
-      double v;
-      switch (accessor.componentType) {
-        case GltfComponentType.byte_:
-          v = view.getInt8(off).toDouble();
-          if (accessor.normalized) v = (v / 127.0).clamp(-1.0, 1.0);
-        case GltfComponentType.unsignedByte:
-          v = view.getUint8(off).toDouble();
-          if (accessor.normalized) v = v / 255.0;
-        case GltfComponentType.short:
-          v = view.getInt16(off, Endian.little).toDouble();
-          if (accessor.normalized) v = (v / 32767.0).clamp(-1.0, 1.0);
-        case GltfComponentType.unsignedShort:
-          v = view.getUint16(off, Endian.little).toDouble();
-          if (accessor.normalized) v = v / 65535.0;
-        case GltfComponentType.unsignedInt:
-          v = view.getUint32(off, Endian.little).toDouble();
-        case GltfComponentType.float:
-          v = view.getFloat32(off, Endian.little);
+  if (bufferView != null) {
+    final stride =
+        bufferView.byteStride ??
+        (componentCount * accessor.componentType.bytes);
+    final start = bufferView.byteOffset + accessor.byteOffset;
+    for (int i = 0; i < accessor.count; i++) {
+      final base = start + i * stride;
+      for (int c = 0; c < componentCount; c++) {
+        out[i * componentCount + c] = _readFloatComponent(
+          view,
+          base + c * accessor.componentType.bytes,
+          accessor.componentType,
+          accessor.normalized,
+        );
       }
-      out[i * componentCount + c] = v;
     }
   }
+  _applySparseFloat(accessor, out, view, allBufferViews);
   return out;
 }
 
@@ -54,39 +44,143 @@ Float32List readAccessorAsFloat32(
 /// into a [Uint32List].
 Uint32List readAccessorAsUint32(
   GltfAccessor accessor,
-  GltfBufferView bufferView,
-  Uint8List bufferData,
-) {
+  GltfBufferView? bufferView,
+  Uint8List bufferData, {
+  List<GltfBufferView>? allBufferViews,
+}) {
   final componentCount = accessor.type.componentCount;
   final totalComponents = accessor.count * componentCount;
   final out = Uint32List(totalComponents);
 
-  final stride =
-      bufferView.byteStride ?? (componentCount * accessor.componentType.bytes);
-  final start = bufferView.byteOffset + accessor.byteOffset;
   final view = ByteData.sublistView(bufferData);
 
-  for (int i = 0; i < accessor.count; i++) {
-    final base = start + i * stride;
-    for (int c = 0; c < componentCount; c++) {
-      final off = base + c * accessor.componentType.bytes;
-      int v;
-      switch (accessor.componentType) {
-        case GltfComponentType.byte_:
-          v = view.getInt8(off);
-        case GltfComponentType.unsignedByte:
-          v = view.getUint8(off);
-        case GltfComponentType.short:
-          v = view.getInt16(off, Endian.little);
-        case GltfComponentType.unsignedShort:
-          v = view.getUint16(off, Endian.little);
-        case GltfComponentType.unsignedInt:
-          v = view.getUint32(off, Endian.little);
-        case GltfComponentType.float:
-          v = view.getFloat32(off, Endian.little).toInt();
+  if (bufferView != null) {
+    final stride =
+        bufferView.byteStride ??
+        (componentCount * accessor.componentType.bytes);
+    final start = bufferView.byteOffset + accessor.byteOffset;
+    for (int i = 0; i < accessor.count; i++) {
+      final base = start + i * stride;
+      for (int c = 0; c < componentCount; c++) {
+        out[i * componentCount + c] = _readIntComponent(
+          view,
+          base + c * accessor.componentType.bytes,
+          accessor.componentType,
+        );
       }
-      out[i * componentCount + c] = v;
     }
   }
+  _applySparseInt(accessor, out, view, allBufferViews);
   return out;
 }
+
+void _applySparseFloat(
+  GltfAccessor accessor,
+  Float32List output,
+  ByteData data,
+  List<GltfBufferView>? bufferViews,
+) {
+  final sparse = accessor.sparse;
+  if (sparse == null) return;
+  if (bufferViews == null) {
+    throw const FormatException('Sparse accessor needs all buffer views.');
+  }
+  final indicesView = bufferViews[sparse.indices.bufferView];
+  final valuesView = bufferViews[sparse.values.bufferView];
+  final components = accessor.type.componentCount;
+  for (var i = 0; i < sparse.count; i++) {
+    final index = _readIntComponent(
+      data,
+      indicesView.byteOffset +
+          sparse.indices.byteOffset +
+          i * sparse.indices.componentType.bytes,
+      sparse.indices.componentType,
+    );
+    final valueBase =
+        valuesView.byteOffset +
+        sparse.values.byteOffset +
+        i * components * accessor.componentType.bytes;
+    for (var component = 0; component < components; component++) {
+      output[index * components + component] = _readFloatComponent(
+        data,
+        valueBase + component * accessor.componentType.bytes,
+        accessor.componentType,
+        accessor.normalized,
+      );
+    }
+  }
+}
+
+void _applySparseInt(
+  GltfAccessor accessor,
+  Uint32List output,
+  ByteData data,
+  List<GltfBufferView>? bufferViews,
+) {
+  final sparse = accessor.sparse;
+  if (sparse == null) return;
+  if (bufferViews == null) {
+    throw const FormatException('Sparse accessor needs all buffer views.');
+  }
+  final indicesView = bufferViews[sparse.indices.bufferView];
+  final valuesView = bufferViews[sparse.values.bufferView];
+  final components = accessor.type.componentCount;
+  for (var i = 0; i < sparse.count; i++) {
+    final index = _readIntComponent(
+      data,
+      indicesView.byteOffset +
+          sparse.indices.byteOffset +
+          i * sparse.indices.componentType.bytes,
+      sparse.indices.componentType,
+    );
+    final valueBase =
+        valuesView.byteOffset +
+        sparse.values.byteOffset +
+        i * components * accessor.componentType.bytes;
+    for (var component = 0; component < components; component++) {
+      output[index * components + component] = _readIntComponent(
+        data,
+        valueBase + component * accessor.componentType.bytes,
+        accessor.componentType,
+      );
+    }
+  }
+}
+
+double _readFloatComponent(
+  ByteData data,
+  int offset,
+  GltfComponentType type,
+  bool normalized,
+) {
+  double value;
+  switch (type) {
+    case GltfComponentType.byte_:
+      value = data.getInt8(offset).toDouble();
+      if (normalized) value = (value / 127.0).clamp(-1.0, 1.0);
+    case GltfComponentType.unsignedByte:
+      value = data.getUint8(offset).toDouble();
+      if (normalized) value /= 255.0;
+    case GltfComponentType.short:
+      value = data.getInt16(offset, Endian.little).toDouble();
+      if (normalized) value = (value / 32767.0).clamp(-1.0, 1.0);
+    case GltfComponentType.unsignedShort:
+      value = data.getUint16(offset, Endian.little).toDouble();
+      if (normalized) value /= 65535.0;
+    case GltfComponentType.unsignedInt:
+      value = data.getUint32(offset, Endian.little).toDouble();
+    case GltfComponentType.float:
+      value = data.getFloat32(offset, Endian.little);
+  }
+  return value;
+}
+
+int _readIntComponent(ByteData data, int offset, GltfComponentType type) =>
+    switch (type) {
+      GltfComponentType.byte_ => data.getInt8(offset),
+      GltfComponentType.unsignedByte => data.getUint8(offset),
+      GltfComponentType.short => data.getInt16(offset, Endian.little),
+      GltfComponentType.unsignedShort => data.getUint16(offset, Endian.little),
+      GltfComponentType.unsignedInt => data.getUint32(offset, Endian.little),
+      GltfComponentType.float => data.getFloat32(offset, Endian.little).toInt(),
+    };

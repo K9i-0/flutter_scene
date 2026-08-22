@@ -131,13 +131,27 @@ GltfMesh _parseMesh(Map<String, Object?> j) {
           material: pj['material'] as int?,
           mode: (pj['mode'] as int?) ?? 4,
           variantMappings: variantMappings,
+          targets: [
+            for (final target in (pj['targets'] as List?) ?? const [])
+              (target as Map).cast<String, int>(),
+          ],
         );
       })
       .toList(growable: false);
-  return GltfMesh(name: j['name'] as String?, primitives: primitives);
+  return GltfMesh(
+    name: j['name'] as String?,
+    primitives: primitives,
+    weights: [
+      for (final weight in (j['weights'] as List?) ?? const [])
+        (weight as num).toDouble(),
+    ],
+  );
 }
 
 GltfAccessor _parseAccessor(Map<String, Object?> j) {
+  final sparse = j['sparse'] as Map?;
+  final sparseIndices = sparse?['indices'] as Map?;
+  final sparseValues = sparse?['values'] as Map?;
   return GltfAccessor(
     componentType: GltfComponentType.fromGlValue(j['componentType'] as int),
     count: j['count'] as int,
@@ -147,6 +161,22 @@ GltfAccessor _parseAccessor(Map<String, Object?> j) {
     normalized: (j['normalized'] as bool?) ?? false,
     min: _numList(j['min']),
     max: _numList(j['max']),
+    sparse: sparse == null || sparseIndices == null || sparseValues == null
+        ? null
+        : GltfAccessorSparse(
+            count: sparse['count'] as int,
+            indices: GltfAccessorSparseIndices(
+              bufferView: sparseIndices['bufferView'] as int,
+              componentType: GltfComponentType.fromGlValue(
+                sparseIndices['componentType'] as int,
+              ),
+              byteOffset: (sparseIndices['byteOffset'] as int?) ?? 0,
+            ),
+            values: GltfAccessorSparseValues(
+              bufferView: sparseValues['bufferView'] as int,
+              byteOffset: (sparseValues['byteOffset'] as int?) ?? 0,
+            ),
+          ),
   );
 }
 

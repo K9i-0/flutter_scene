@@ -126,6 +126,12 @@ abstract class Geometry {
   ByteData? _cpuVertices;
   ByteData? _cpuIndices;
 
+  gpu.DeviceBuffer? _mutableVertexBuffer;
+  int _mutableVertexBytes = 0;
+
+  /// Optional CPU morph-target controller installed by the runtime importer.
+  MorphTargetController? morphTargets;
+
   // Structure-of-arrays CPU copies for raycasting and readback, set by the
   // SoA upload path instead of the interleaved [_cpuVertices]. Position is
   // required to raycast; texture coordinates let a hit report a UV; normals
@@ -390,6 +396,77 @@ abstract class Geometry {
     if (_localBounds == null && vertexCount > 0 && _autoScanBoundsOnUpload) {
       _scanLocalBoundsFromVertices(vertices, vertexCount);
     }
+  }
+
+  /// Uploads interleaved geometry into a host-visible vertex buffer that may
+  /// be overwritten by [updateMutableVertexData].
+  ///
+  /// This path intentionally keeps even unskinned attributes interleaved. It
+  /// is used for CPU morph targets, where expression changes update position
+  /// and normal values without reallocating geometry or material state.
+  void uploadMutableVertexData(
+    ByteData vertices,
+    int vertexCount,
+    ByteData? indices, {
+    gpu.IndexType indexType = gpu.IndexType.int16,
+  }) {
+    final stride = _expectedVertexStrideInBytes;
+    if (stride != null && vertices.lengthInBytes != vertexCount * stride) {
+      throw ArgumentError(
+        'uploadMutableVertexData got ${vertices.lengthInBytes} bytes for '
+        '$vertexCount vertices; expected ${vertexCount * stride}.',
+      );
+    }
+    final vertexBuffer = gpu.gpuContext.createDeviceBuffer(
+      gpu.StorageMode.hostVisible,
+      vertices.lengthInBytes,
+    );
+    vertexBuffer.overwrite(vertices);
+    vertexBuffer.flush();
+    _mutableVertexBuffer = vertexBuffer;
+    _mutableVertexBytes = vertices.lengthInBytes;
+    _cpuVertices = vertices;
+    _cpuIndices = indices;
+    setVertices(
+      gpu.BufferView(
+        vertexBuffer,
+        offsetInBytes: 0,
+        lengthInBytes: vertices.lengthInBytes,
+      ),
+      vertexCount,
+    );
+    if (indices != null) {
+      final indexBuffer = gpu.gpuContext.createDeviceBufferWithCopy(indices);
+      setIndices(
+        gpu.BufferView(
+          indexBuffer,
+          offsetInBytes: 0,
+          lengthInBytes: indices.lengthInBytes,
+        ),
+        indexType,
+      );
+    }
+    if (_localBounds == null && vertexCount > 0 && _autoScanBoundsOnUpload) {
+      _scanLocalBoundsFromVertices(vertices, vertexCount);
+    }
+  }
+
+  /// Overwrites vertex bytes previously uploaded with
+  /// [uploadMutableVertexData].
+  void updateMutableVertexData(ByteData vertices) {
+    final buffer = _mutableVertexBuffer;
+    if (buffer == null) {
+      throw StateError('uploadMutableVertexData must be called first.');
+    }
+    if (vertices.lengthInBytes != _mutableVertexBytes) {
+      throw ArgumentError(
+        'Mutable vertex byte length changed from $_mutableVertexBytes to '
+        '${vertices.lengthInBytes}.',
+      );
+    }
+    buffer.overwrite(vertices);
+    buffer.flush();
+    _cpuVertices = vertices;
   }
 
   /// Packs [streams] (one tightly packed buffer per vertex slot) and any
@@ -1280,6 +1357,92 @@ class SkinnedGeometry extends Geometry {
       frameInfoFloats.buffer.asByteData(),
     );
     pass.bindUniform(frameInfoSlot, frameInfoView);
+  }
+}
+
+/// Position and normal deltas for one glTF morph target.
+class MorphTarget {
+  MorphTarget({required this.positions, required this.normals});
+
+  /// Three floats per vertex.
+  final Float32List positions;
+
+  /// Three floats per vertex. Missing glTF normal deltas are represented by
+  /// zeroes.
+  final Float32List normals;
+}
+
+/// Applies glTF morph targets to an imported geometry on the CPU.
+///
+/// This validation implementation keeps a reusable host-visible GPU buffer,
+/// so changing expression weights does not reallocate the mesh. A future GPU
+/// path can preserve this public API while moving blending into a shader.
+class MorphTargetController {
+  MorphTargetController({
+    required Geometry geometry,
+    required ByteData baseVertices,
+    required int vertexCount,
+    required List<MorphTarget> targets,
+  }) : _geometry = geometry,
+       _base = Float32List.fromList(Float32List.sublistView(baseVertices)),
+       _working = Float32List.fromList(Float32List.sublistView(baseVertices)),
+       _vertexCount = vertexCount,
+       _targets = List.unmodifiable(targets),
+       _weights = List<double>.filled(targets.length, 0.0) {
+    final expected = vertexCount * 3;
+    for (final target in targets) {
+      if (target.positions.length != expected ||
+          target.normals.length != expected) {
+        throw ArgumentError('Morph target length does not match vertex count.');
+      }
+    }
+  }
+
+  final Geometry _geometry;
+  final Float32List _base;
+  final Float32List _working;
+  final int _vertexCount;
+  final List<MorphTarget> _targets;
+  final List<double> _weights;
+
+  int get targetCount => _targets.length;
+
+  List<double> get weights => List.unmodifiable(_weights);
+
+  void setWeight(int index, double weight) {
+    if (index < 0 || index >= _weights.length) {
+      throw RangeError.index(index, _weights, 'index');
+    }
+    _weights[index] = weight;
+    _apply();
+  }
+
+  void setWeights(List<double> weights) {
+    for (var i = 0; i < _weights.length; i++) {
+      _weights[i] = i < weights.length ? weights[i] : 0.0;
+    }
+    _apply();
+  }
+
+  void _apply() {
+    _working.setAll(0, _base);
+    final stride = _working.length ~/ _vertexCount;
+    for (var targetIndex = 0; targetIndex < _targets.length; targetIndex++) {
+      final weight = _weights[targetIndex];
+      if (weight == 0.0) continue;
+      final target = _targets[targetIndex];
+      for (var vertex = 0; vertex < _vertexCount; vertex++) {
+        final packed = vertex * stride;
+        final delta = vertex * 3;
+        _working[packed] += target.positions[delta] * weight;
+        _working[packed + 1] += target.positions[delta + 1] * weight;
+        _working[packed + 2] += target.positions[delta + 2] * weight;
+        _working[packed + 3] += target.normals[delta] * weight;
+        _working[packed + 4] += target.normals[delta + 1] * weight;
+        _working[packed + 5] += target.normals[delta + 2] * weight;
+      }
+    }
+    _geometry.updateMutableVertexData(ByteData.sublistView(_working));
   }
 }
 

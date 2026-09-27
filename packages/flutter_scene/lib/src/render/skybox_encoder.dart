@@ -12,6 +12,7 @@ import 'package:flutter_scene/src/scene_encoder.dart' show resolvePipeline;
 import 'package:flutter_scene/src/shaders.dart';
 import 'package:flutter_scene/src/skybox.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
+import 'package:flutter_scene/src/render/planar_reflection.dart';
 
 // Two triangles of NDC positions covering the whole render target (6 vec2s).
 final gpu.DeviceBuffer _fullscreenQuad = gpu.gpuContext
@@ -143,7 +144,14 @@ void _bindFrameInfo(
 Matrix4 skyboxInverseViewProjection(Camera camera, ui.Size dimensions) {
   final viewRotation = camera.getViewMatrix().clone()
     ..setTranslationRaw(0.0, 0.0, 0.0);
-  final projection = camera.projection.getProjectionMatrix(
+  // The sky is infinitely distant and must not use the water/mirror clipping
+  // plane. Oblique clipping makes far-plane homogeneous w vary per vertex;
+  // dividing by it before interpolation distorts the fullscreen sky rays.
+  var skyProjection = camera.projection;
+  while (skyProjection is ObliqueNearClipProjection) {
+    skyProjection = skyProjection.base;
+  }
+  final projection = skyProjection.getProjectionMatrix(
     dimensions.width / dimensions.height,
   );
   final viewProjection = projection * viewRotation;

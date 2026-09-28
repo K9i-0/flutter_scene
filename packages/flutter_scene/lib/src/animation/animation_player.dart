@@ -116,6 +116,7 @@ class AnimationPlayer {
     // Reset the animated pose state.
     for (final transforms in _targetTransforms.values) {
       transforms.animatedPose = transforms.bindPose.clone();
+      transforms.rotationBlendWeight = 1;
       final bindWeights = transforms.bindMorphWeights;
       if (bindWeights != null) {
         transforms.animatedMorphWeights!.setAll(0, bindWeights);
@@ -128,6 +129,27 @@ class AnimationPlayer {
       totalWeight += clip.weight;
     }
     double weightMultiplier = totalWeight > 1.0 ? 1.0 / totalWeight : 1.0;
+
+    // Only rotation channels targeting this node consume its bind contribution.
+    // Sequential slerp with raw clip weights leaks the bind pose into a full
+    // crossfade (even two identical 90-degree poses became 67.5 degrees at .5/.5).
+    // Seed cumulative blending with the residual bind weight instead.
+    for (final clip in _clips.values) {
+      final weight = clip.weight * weightMultiplier;
+      for (final binding in clip._bindings) {
+        if (binding.channel.bindTarget.property == AnimationProperty.rotation) {
+          final transforms = _targetTransforms[binding.node]!;
+          transforms.rotationBlendWeight =
+              transforms.rotationBlendWeight! - weight;
+        }
+      }
+    }
+    for (final transforms in _targetTransforms.values) {
+      transforms.rotationBlendWeight = max(
+        0.0,
+        transforms.rotationBlendWeight!,
+      );
+    }
 
     // Update and apply all clips to the animation pose state.
     for (final clip in _clips.values) {

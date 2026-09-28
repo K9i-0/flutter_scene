@@ -1483,10 +1483,13 @@ base class Node implements SceneGraph {
   /// tick. [ancestorsVisible] is whether every ancestor of this node is
   /// visible, and defaults to `true` for the root.
   void scenePrePass(double deltaSeconds, [bool ancestorsVisible = true]) {
-    _effectiveVisible = ancestorsVisible && visible;
-
     // Components tick whenever the node is mounted, independent of visibility.
     _visitMutable(_components, (component) => component.tick(deltaSeconds));
+
+    // A component may change its owner's visibility during this tick. Use the
+    // resulting state for both this node's render items and its descendants,
+    // so hide/show takes effect in the same frame.
+    _effectiveVisible = ancestorsVisible && visible;
 
     if (_effectiveVisible) {
       _animationPlayer?.update(deltaSeconds);

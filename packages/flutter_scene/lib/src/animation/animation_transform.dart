@@ -69,6 +69,11 @@ class AnimationTransforms {
   /// solely by a morph weights channel keeps its manual transform.
   bool drivesTransform = false;
 
+  /// Rotation weight already accumulated this frame, initially the uncovered
+  /// bind-pose weight for this node. Set by AnimationPlayer; null preserves
+  /// direct resolver calls' single weighted-slerp behavior.
+  double? rotationBlendWeight;
+
   /// The node's rest morph weights, captured when the first weights channel
   /// binds it; null while no weights channel targets the node.
   Float32List? bindMorphWeights;

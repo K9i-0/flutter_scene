@@ -22,7 +22,7 @@ A frame has a fixed wall-clock budget set by the refresh rate.
 
 ## Measure first (do not skip this)
 
-There is no runtime stats API (`scene.frameTime` does not exist), but the renderer has compile-time profiling. Measurement is those defines plus Flutter's own tooling.
+Use `scene.renderStats.latest` for per-view and per-pass CPU times, dimensions, draw counters, and pipeline builds; `scene.renderStats.history` retains recent frames. These are CPU encoding times, not GPU timestamps. A GPU-paced frame has no screen view graph: count only new screen views, and report `scene.pacedFrameCount` separately. Flutter presentation FPS and calls to `Scene.render` can include re-presentations and must not stand in for fresh 3D FPS. Compile-time profiling and Flutter's own tooling complement these counters.
 
 1. **Run in profile mode.** `flutter run --profile --enable-flutter-gpu`. Debug-mode timings are meaningless for performance (assertions, no JIT-to-AOT optimization, extra checks), so never judge speed in debug.
 2. **Engine pass timing.** Add `--dart-define=FLUTTER_SCENE_PROFILE=true` and the renderer prints sampled per-pass CPU means and maxes to stdout (`ScenePass`, `DepthPrepass`, `ShadowPass`, `BloomPass`, ...) plus encoder stats (`FLUTTER_SCENE_PROFILE_ENCODER`, draw and instance counts, sort/encode/instance-pack times). A healthy mean next to a huge max is a one-off stall, not steady-state cost; find the stall (see the pipeline section below) instead of shrinking the steady state.

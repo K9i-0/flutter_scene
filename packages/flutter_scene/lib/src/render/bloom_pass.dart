@@ -61,15 +61,18 @@ int bloomPrefilterScale(double footprint) =>
 ({double source, double base}) bloomUpsampleWeights(
   double levelWeight,
   int level,
-  int levels,
-) {
+  int levels, {
+  int? normalization,
+}) {
   // Combined weight of the coarser mips, relative to this level's.
   var coarser = 0.0;
   for (var j = levels - level - 2; j >= 0; j--) {
     coarser = 1.0 + levelWeight * coarser;
   }
   coarser *= levelWeight;
-  final scale = level == 0 ? levels / (1.0 + coarser) : 1.0 / (1.0 + coarser);
+  final scale = level == 0
+      ? (normalization ?? levels) / (1.0 + coarser)
+      : 1.0 / (1.0 + coarser);
   return (source: coarser * scale, base: scale);
 }
 
@@ -162,7 +165,7 @@ class BloomPass extends RenderGraphPass {
     final sizes = <ui.Size>[];
     var width = base.width.floor();
     var height = base.height.floor();
-    for (var i = 0; i < _kMipCount; i++) {
+    for (var i = 0; i < _settings.mipCount.clamp(3, _kMipCount); i++) {
       width = math.max(1, width);
       height = math.max(1, height);
       down.add(
@@ -221,7 +224,12 @@ class BloomPass extends RenderGraphPass {
         sourceSize: sizes[i + 1],
         base: down[i],
         target: target,
-        weights: bloomUpsampleWeights(levelWeight, i, down.length),
+        weights: bloomUpsampleWeights(
+          levelWeight,
+          i,
+          down.length,
+          normalization: _kMipCount,
+        ),
       );
       up[i] = target;
     }

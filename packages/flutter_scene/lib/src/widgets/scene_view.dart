@@ -105,6 +105,7 @@ class SceneView extends StatefulWidget {
     this.cameraBuilder,
     this.viewsBuilder,
     this.autoTick = true,
+    this.repaintOnGpuCompletion = true,
     this.pixelRatio,
     this.onTick,
     this.clock,
@@ -152,6 +153,7 @@ class SceneView extends StatefulWidget {
     this.cameraBuilder,
     this.viewsBuilder,
     this.autoTick = true,
+    this.repaintOnGpuCompletion = true,
     this.pixelRatio,
     this.onTick,
     this.clock,
@@ -218,6 +220,11 @@ class SceneView extends StatefulWidget {
   /// scene that only needs to repaint when the app rebuilds the view (for
   /// example with a new [camera]).
   final bool autoTick;
+
+  /// Retry a GPU-paced frame when its outstanding work completes. Disable
+  /// when an external repaint driver owns the cadence, so completion cannot
+  /// bypass its frame cap. The driver must continue requesting frames.
+  final bool repaintOnGpuCompletion;
 
   /// Logical-to-physical pixel multiplier for the offscreen render target,
   /// forwarded to [Scene.render]. Defaults to the view's device pixel ratio.
@@ -401,7 +408,11 @@ class _SceneViewState extends State<SceneView>
   void _onAssetsRefreshed() => _repaint.notify();
 
   // A paced frame's GPU work finished; paint the frame the view held.
-  void _onRepaintRequested() => _repaint.notify();
+  void _onRepaintRequested() {
+    // An automatic ticker will retry on its next permitted frame. Retrying
+    // here would bypass maxFrameRate and encode without onTick advancing.
+    if (widget.repaintOnGpuCompletion && !widget.autoTick) _repaint.notify();
+  }
 
   // Creates the owned scene for the declarative form and applies every scene
   // prop, the single creation path for initState and constructor-form

@@ -1,5 +1,8 @@
 ## 0.24.4
 
+* Fork: `BloomSettings.mipCount` selects 3–6 levels. Four levels use seven passes instead of eleven, preserving constant-input brightness with a tighter glow.
+* Fork: GPU-completion retries no longer bypass `SceneView.maxFrameRate` while auto-ticking. External repaint drivers can set `repaintOnGpuCompletion: false` to retain control of their cadence.
+
 * glTF imports read `EXT_texture_webp` textures, so a model whose textures are only WebP loads instead of failing.
 * glTF imports honor `KHR_node_visibility`, so a node marked hidden imports hidden along with its subtree.
 * glTF imports play `KHR_animation_pointer` animations of node visibility, light color, intensity, range, and cone angles, material factors, and texture transforms. A pointer the engine can't drive warns and is skipped.

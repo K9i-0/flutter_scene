@@ -890,6 +890,9 @@ base class SceneEncoder {
   gpu.RenderPipeline? _boundPipeline;
   Material? _boundMaterial;
   bool _boundMaterialFallback = false;
+  gpu.CullMode? _boundMaterialFaceCull;
+  // The faces one draw of a blended double-sided record keeps.
+  gpu.CullMode? _faceCull;
   gpu.Shader? _boundMaterialVertex;
   gpu.Shader? _boundFrameInfoShader;
   double _boundFrameInfoDepthBias = double.nan;
@@ -962,9 +965,7 @@ base class SceneEncoder {
     // A material that cannot show the active debug view draws through the
     // engine's fallback debug fragment shader instead of its own.
     final fallback = _usesDebugFallback(item, material, geometry);
-    final materialVertex = material.materialVertexShader(
-      geometry.materialVertexVariant,
-    );
+    final materialVertex = material.vertexShaderForGeometry(geometry);
     final vertexShader = materialVertex ?? geometry.vertexShader;
     final fragmentShader = fallback
         ? _debugFallbackShader
@@ -1333,9 +1334,7 @@ base class SceneEncoder {
         !geometry.emitsStandardVaryings) {
       return null;
     }
-    final materialVertex = material.materialVertexShader(
-      geometry.materialVertexVariant,
-    );
+    final materialVertex = material.vertexShaderForGeometry(geometry);
     return tryResolvePipeline(
       materialVertex ?? geometry.vertexShader,
       _debugFallbackShader,
@@ -1462,6 +1461,7 @@ base class SceneEncoder {
     if (identical(_boundMaterial, material) &&
         identical(_boundMaterialVertex, materialVertex) &&
         _boundMaterialFallback == fallback &&
+        _boundMaterialFaceCull == _faceCull &&
         _boundMaterialFade == fade &&
         _boundMaterialLightOffset == lightOffset &&
         _boundMaterialLightCount == lightCount &&
@@ -1479,6 +1479,9 @@ base class SceneEncoder {
       material.lodFade = fade;
       material.bind(_renderPass, _transientsBuffer, _lighting);
     }
+    final faceCull = _faceCull;
+    if (faceCull != null) _renderPass.setCullMode(faceCull);
+    _boundMaterialFaceCull = faceCull;
     _boundWindingOrder = null;
     if (materialVertex != null) {
       material.bindVertexStage(_renderPass, materialVertex, _transientsBuffer);
@@ -1744,9 +1747,7 @@ base class SceneEncoder {
     // A `vertex { }` material supplies its own vertex shader for this mesh
     // type; the geometry must bind FrameInfo (and skinned's joints texture)
     // against it, since its uniform slots can differ from the engine default.
-    final materialVertex = material.materialVertexShader(
-      geometry.materialVertexVariant,
-    );
+    final materialVertex = material.vertexShaderForGeometry(geometry);
     if (item != null) {
       _describeDraw(
         item,
@@ -1907,9 +1908,7 @@ base class SceneEncoder {
       _clearBindings();
     }
     _bindPipeline(pipeline);
-    final materialVertex = material.materialVertexShader(
-      geometry.materialVertexVariant,
-    );
+    final materialVertex = material.vertexShaderForGeometry(geometry);
     if (item != null) {
       _describeDraw(
         item,
@@ -2065,9 +2064,7 @@ base class SceneEncoder {
       _clearBindings();
     }
     _bindPipeline(pipeline);
-    final materialVertex = material.materialVertexShader(
-      geometry.materialVertexVariant,
-    );
+    final materialVertex = material.vertexShaderForGeometry(geometry);
     if (item != null) {
       _describeDraw(
         item,
@@ -2554,6 +2551,66 @@ base class SceneEncoder {
     );
   }
 
+  /// Encodes a blended [record]. A double-sided mesh that culls no face draws
+  /// its back faces and then its front faces, so its near side blends over its
+  /// far side.
+  void _encodeBlended(_TranslucentRecord record) {
+    if (!record.material.doubleSided ||
+        record.material.renderCullMode != gpu.CullMode.none) {
+      _encodeBlendedFaces(record);
+      return;
+    }
+    try {
+      _faceCull = gpu.CullMode.frontFace;
+      _encodeBlendedFaces(record);
+      _faceCull = gpu.CullMode.backFace;
+      _encodeBlendedFaces(record);
+    } finally {
+      _faceCull = null;
+    }
+  }
+
+  void _encodeBlendedFaces(_TranslucentRecord record) {
+    final instances = record.item.instanceTransforms;
+    if (instances != null) {
+      _encodeInstanced(
+        record.pipeline,
+        record.worldTransform,
+        record.geometry,
+        record.material,
+        instances,
+        record.item.instanceColors!,
+        record.windingFlipped,
+        record.fade,
+        instanceWindingFlipped: record.item.instanceWindingFlipped,
+        instanceIndices: record.item.visibleInstanceIndices,
+        sortBackToFrontFrom: record.item.sortTransparentInstances
+            ? _cameraPosition
+            : null,
+        packedWorldData: record.windingFlipped == record.item.windingFlipped
+            ? record.item.instanceWorldData
+            : null,
+        packedWorldWindingFlipped:
+            record.windingFlipped == record.item.windingFlipped
+            ? record.item.instanceWorldWindingFlipped
+            : null,
+        attributeData: record.item.instanceAttributeData,
+        attributeFloats: record.item.instanceAttributeFloats,
+        item: record.item,
+      );
+    } else {
+      _encode(
+        record.pipeline,
+        record.worldTransform,
+        record.geometry,
+        record.material,
+        record.windingFlipped,
+        record.fade,
+        item: record.item,
+      );
+    }
+  }
+
   void _flushTranslucentThrough(int end, {gpu.RenderPass? translucentPass}) {
     _prepareTranslucent();
     if (_translucentCursor >= _translucentRecords.length) return;
@@ -2607,44 +2664,7 @@ base class SceneEncoder {
         record.geometry.setJointsTexture(joints, record.jointsTextureWidth);
       }
       record.item.applyMorphWeights(record.geometry);
-      final instances = record.item.instanceTransforms;
-      if (instances != null) {
-        _encodeInstanced(
-          record.pipeline,
-          record.worldTransform,
-          record.geometry,
-          record.material,
-          instances,
-          record.item.instanceColors!,
-          record.windingFlipped,
-          record.fade,
-          instanceWindingFlipped: record.item.instanceWindingFlipped,
-          instanceIndices: record.item.visibleInstanceIndices,
-          sortBackToFrontFrom: record.item.sortTransparentInstances
-              ? _cameraPosition
-              : null,
-          packedWorldData: record.windingFlipped == record.item.windingFlipped
-              ? record.item.instanceWorldData
-              : null,
-          packedWorldWindingFlipped:
-              record.windingFlipped == record.item.windingFlipped
-              ? record.item.instanceWorldWindingFlipped
-              : null,
-          attributeData: record.item.instanceAttributeData,
-          attributeFloats: record.item.instanceAttributeFloats,
-          item: record.item,
-        );
-      } else {
-        _encode(
-          record.pipeline,
-          record.worldTransform,
-          record.geometry,
-          record.material,
-          record.windingFlipped,
-          record.fade,
-          item: record.item,
-        );
-      }
+      _encodeBlended(record);
     }
     encodeWatch?.stop();
     _translucentEncodeMicros += encodeWatch?.elapsedMicroseconds ?? 0;
@@ -2737,44 +2757,7 @@ base class SceneEncoder {
         record.geometry.setJointsTexture(joints, record.jointsTextureWidth);
       }
       record.item.applyMorphWeights(record.geometry);
-      final instances = record.item.instanceTransforms;
-      if (instances != null) {
-        _encodeInstanced(
-          record.pipeline,
-          record.worldTransform,
-          record.geometry,
-          record.material,
-          instances,
-          record.item.instanceColors!,
-          record.windingFlipped,
-          record.fade,
-          instanceWindingFlipped: record.item.instanceWindingFlipped,
-          instanceIndices: record.item.visibleInstanceIndices,
-          sortBackToFrontFrom: record.item.sortTransparentInstances
-              ? _cameraPosition
-              : null,
-          packedWorldData: record.windingFlipped == record.item.windingFlipped
-              ? record.item.instanceWorldData
-              : null,
-          packedWorldWindingFlipped:
-              record.windingFlipped == record.item.windingFlipped
-              ? record.item.instanceWorldWindingFlipped
-              : null,
-          attributeData: record.item.instanceAttributeData,
-          attributeFloats: record.item.instanceAttributeFloats,
-          item: record.item,
-        );
-      } else {
-        _encode(
-          record.pipeline,
-          record.worldTransform,
-          record.geometry,
-          record.material,
-          record.windingFlipped,
-          record.fade,
-          item: record.item,
-        );
-      }
+      _encodeBlended(record);
     }
 
     _drawTransformOverride = null;

@@ -696,6 +696,15 @@ void main() {
     );
   });
 
+  test('texture rotation follows KHR_texture_transform', () {
+    // u' = c * u + s * v, v' = -s * u + c * v, as the extension's example
+    // implies. The opposite sign points TextureTransformTest's arrow at red.
+    final inputs = File('shaders/material_inputs.glsl').readAsStringSync();
+
+    expect(inputs, contains('rotation.x * scaled.x + rotation.y * scaled.y'));
+    expect(inputs, contains('-rotation.y * scaled.x + rotation.x * scaled.y'));
+  });
+
   test('filtered scene color lives in a reviewable shader include', () {
     final filtered = File(
       'shaders/filtered_scene_color.glsl',
@@ -730,7 +739,7 @@ void main() {
       source,
       contains('(1.0 - 0.5 * material.sheen_roughness) * occlusion *'),
     );
-    expect(source, contains('return roughness;'));
+    expect(source, contains('float filtered = roughness;'));
     expect(source, contains('max(material.sheen_roughness, kMinRoughness)'));
     expect(pbr, contains('kMinRoughness * kMinRoughness'));
     expect(
@@ -821,7 +830,19 @@ void main() {
     expect(normals, contains('vec4 authored = GetWorldTangent();'));
     expect(
       normals,
-      contains('return CotangentFrame(normal, view_vector, uv);'),
+      contains('mat3 frame = CotangentFrame(normal, view_vector, uv);'),
+    );
+  });
+
+  test('derived tangent frames orient like supplied tangents', () {
+    // Without both, a mesh with no tangents reads one normal-map channel
+    // inverted (NormalTangentTest's flipped Y).
+    final normals = File('shaders/normals.glsl').readAsStringSync();
+
+    expect(normals, contains('dot(cross(d_view_x, d_view_y), normal) < 0.0'));
+    expect(
+      normals,
+      contains('B *= gl_FrontFacing ? -orientation : orientation;'),
     );
   });
 

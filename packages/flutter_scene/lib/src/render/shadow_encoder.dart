@@ -167,6 +167,10 @@ class ShadowEncoder {
         }
       }
     }
+    // Recompute for this light/cascade, never reuse the camera's selection.
+    // Each shadow tile submits and flushes synchronously, before another
+    // encoder can reuse RenderItem's per-view instance scratch.
+    if (!item.cullVisibleInstances(frustum, receiverPlanes)) return;
     _records.add(item);
   }
 
@@ -195,7 +199,8 @@ class ShadowEncoder {
       if (end > index + 1) {
         _batchPool.reset();
         for (var batchIndex = index; batchIndex < end; batchIndex++) {
-          _batchPool.addFor(_records[batchIndex], indices: null);
+          final item = _records[batchIndex];
+          _batchPool.addFor(item, indices: item.visibleInstanceIndices);
         }
         final batches = _batchPool.batches;
         _encode(first, batches: batches);
@@ -360,15 +365,16 @@ class ShadowEncoder {
     final instances = item.instanceTransforms;
     if (instances != null) {
       final visible = limitInstanceIndices(
-        null,
+        item.visibleInstanceIndices,
         instances.length,
         instanceLimit,
       );
       if (geometry.instancedVertexLayout == null) {
         // Skinned geometry has no instance-attribute path; loop.
-        for (final instanceTransform in instances.take(
-          visible?.length ?? instances.length,
-        )) {
+        final count = visible?.length ?? instances.length;
+        for (var slot = 0; slot < count; slot++) {
+          final instanceIndex = visible?[slot] ?? slot;
+          final instanceTransform = instances[instanceIndex];
           _bindDraw(item.worldTransform * instanceTransform);
           final flip =
               item.windingFlipped != (instanceTransform.determinant() < 0);
@@ -385,6 +391,7 @@ class ShadowEncoder {
       final packedWorldData = item.instanceWorldData;
       final packedWinding = item.instanceWorldWindingFlipped;
       if (depthVertex == null &&
+          item.visibleInstanceIndices == null &&
           packedWorldData != null &&
           packedWinding != null &&
           item.instanceAttributeFloats == attributeFloats) {

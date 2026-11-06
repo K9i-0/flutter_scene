@@ -322,9 +322,12 @@ EnvironmentMap buildEnvironmentFromFaces(
 /// An incremental sky bake: one GPU pass per [advance] call, so a refreshing
 /// sky-driven environment costs a bounded slice per frame instead of a spike.
 ///
-/// A cycle is `6 + 1 + kPrefilterBandCount + 1` steps: the six cube faces,
-/// the equirect assembly, one prefilter roughness band per step (the bulk of
-/// the bake's cost, split by band), and finally the SH projection. The
+/// A cycle is `6 + 1 + prefilter + 1` steps: the six cube faces, the
+/// equirect assembly, the prefilter (the bulk of the bake's cost), and finally
+/// the SH projection. The prefilter runs one roughness band of one cube face
+/// per step (`6 * kPrefilterBandCount` steps) on the cube layout, or one band
+/// per step on the atlas layout. A whole band of six 512² faces in one frame
+/// stalled a thermally throttled mobile GPU for ~200 ms. The
 /// outputs are double-buffered: a cycle writes into the atlas/SH pair the
 /// scene is *not* currently sampling, and the finished pair is returned by
 /// the last [advance] for the caller to publish, so a partially-baked
@@ -352,7 +355,8 @@ class SkyBakeJob {
   int _step = -1;
   static const int _equirectStep = 6;
   static const int _firstBandStep = 7;
-  static const int _shStep = _firstBandStep + kPrefilterBandCount;
+  int get _shStep =>
+      _firstBandStep + kPrefilterBandCount * (_useCube ? 6 : 1);
 
   /// Whether a cycle is in progress.
   bool get inFlight => _step >= 0;
@@ -402,18 +406,17 @@ class SkyBakeJob {
     } else if (step == _equirectStep) {
       _assembleEquirect(_faces!, _equirect!, _faceResolution);
     } else if (step < _shStep) {
-      final band = step - _firstBandStep;
+      final index = step - _firstBandStep;
       if (_useCube) {
-        for (var face = 0; face < 6; face++) {
-          prefilterEquirectRadianceCubeFace(
-            _equirect!,
-            _atlases[_writeIndex]!,
-            face,
-            band,
-            sourceIsLinear: true,
-          );
-        }
+        prefilterEquirectRadianceCubeFace(
+          _equirect!,
+          _atlases[_writeIndex]!,
+          index % 6,
+          index ~/ 6,
+          sourceIsLinear: true,
+        );
       } else {
+        final band = index;
         prefilterEquirectRadianceBand(
           _equirect!,
           _atlases[_writeIndex]!,

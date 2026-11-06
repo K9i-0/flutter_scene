@@ -416,13 +416,6 @@ class EngineLightingUniforms {
         buffer[22] = direction.z;
       }
     }
-    // Cel shading of the sun rides in the unused color.w / sun_dir.w lanes,
-    // independent of whether fog is on (DirectionalLight.toon).
-    final toonLight = lighting.directionalLight;
-    if (toonLight != null && toonLight.toon > 0.0) {
-      buffer[15] = toonLight.toon.clamp(0.0, 1.0);
-      buffer[23] = toonLight.toonThreshold.clamp(0.0, 1.0);
-    }
     // buffer[1] left 0 (disabled) when there is no active fog.
     pass.bindUniform(
       shader.cachedUniformSlot('FogInfo'),

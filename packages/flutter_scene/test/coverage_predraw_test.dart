@@ -81,7 +81,16 @@ void main() {
       'shaders/flutter_scene_standard.frag',
       'shaders/flutter_scene_unlit.frag',
     ]) {
-      final code = _code(File(path).readAsStringSync());
+      // Only the opt-in masked twins (alphaMaskInShader) compile the block
+      // guarded by FLUTTER_SCENE_ALPHA_MASK_IN_SHADER; every other variant
+      // must stay discard-free.
+      final code = _code(File(path).readAsStringSync()).replaceAll(
+        RegExp(
+          r'#ifdef FLUTTER_SCENE_ALPHA_MASK_IN_SHADER.*?#endif',
+          dotAll: true,
+        ),
+        '',
+      );
       expect(code, isNot(contains('discard')), reason: path);
       expect(code, isNot(contains('ApplyLodFade')), reason: path);
     }

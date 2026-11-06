@@ -60,6 +60,14 @@ void Surface(inout MaterialInputs material) {
   // shader never discards; a discard would turn off early depth testing and
   // hidden-surface removal for every draw on tiled GPUs.
   if (frag_info.alpha_mode == 1.0) {
+#ifdef FLUTTER_SCENE_ALPHA_MASK_IN_SHADER
+    // Masked twin: test the cutoff here and skip the coverage pre-draw. It
+    // costs early depth testing on this shader only, in exchange for one
+    // draw per masked surface (CPU-bound mobile scenes with many cutouts).
+    if (alpha < frag_info.alpha_cutoff) {
+      discard;
+    }
+#endif
     alpha = 1.0;
   }
   material.base_color = vec4(albedo, alpha);

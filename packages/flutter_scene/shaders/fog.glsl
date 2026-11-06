@@ -20,7 +20,7 @@ uniform FogInfo {
   // x: height (reference altitude)   y: height falloff (0 = uniform)
   // z: sun in-scatter strength (0 = off)   w: sun in-scatter exponent
   highp vec4 params2;
-  // rgb: flat fog color (linear)   w: unused
+  // rgb: flat fog color (linear)   w: sun cel shading (DirectionalLight.toon)
   vec4 color;
   // rgb: directional light color * intensity (linear)   w: has-sun (> 0.5)
   vec4 sun;

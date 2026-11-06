@@ -130,6 +130,8 @@ class DirectionalLight {
     this.shadowCascadeSplitLambda = 0.6,
     this.firstCascadeFarBound,
     this.cascadeOverlap = 0.0,
+    this.toon = 0.0,
+    this.toonThreshold = 0.15,
     this.shadowMapResolution = 1024,
     this.shadowDepthBias = 0.02,
     this.shadowNormalBias = 0.02,
@@ -231,6 +233,18 @@ class DirectionalLight {
   /// cost a second cascade lookup.
   /// {@category Lighting and environment}
   double cascadeOverlap;
+
+  /// Cel shading of this light on standard materials (0 = physically based,
+  /// 1 = fully banded). The light's falloff across a surface and its shadow
+  /// collapse to a lit and an unlit band, split where the lit amount crosses
+  /// [toonThreshold], with a narrow anti-aliased edge. Ambient and other
+  /// lights are unchanged. Materials with lighting hooks ignore it.
+  /// {@category Lighting and environment}
+  double toon;
+
+  /// Lit amount (n·l times shadow visibility, 0..1) where [toon] switches
+  /// from the unlit to the lit band.
+  double toonThreshold;
 
   /// Pixel resolution of the (square) shadow map. With cascades this is
   /// the resolution of each cascade's tile.

@@ -1115,13 +1115,23 @@ highp vec4 EvaluateLighting(MaterialInputs material) {
     direct_specular += sun_specular;
 #endif
 #else
-    direct += EvaluateAnalyticLight(material, light_vector,
-                                   frag_info.directional_light_color.rgb, normal,
-                                   camera_normal, albedo, metallic, roughness,
-                                   reflectance, n_dot_v, material.specular,
-                                   anisotropic_tangent,
-                                   anisotropic_bitangent) *
-             sun_visibility;
+    highp vec3 sun_direct =
+        EvaluateAnalyticLight(material, light_vector,
+                              frag_info.directional_light_color.rgb, normal,
+                              camera_normal, albedo, metallic, roughness,
+                              reflectance, n_dot_v, material.specular,
+                              anisotropic_tangent, anisotropic_bitangent) *
+        sun_visibility;
+    // Cel shading (DirectionalLight.toon, fog.color.w): replace the smooth
+    // n.l x shadow falloff with a lit / unlit band at fog.sun_dir.w. The
+    // direct term is proportional to n.l, so dividing it out leaves the
+    // fully lit colour.
+    if (fog.color.w > 0.0) {
+      float lit = max(dot(normal, light_vector), 0.0) * sun_visibility;
+      float band = smoothstep(fog.sun_dir.w - 0.025, fog.sun_dir.w + 0.025, lit);
+      sun_direct *= mix(1.0, band / max(lit, 0.02), fog.color.w);
+    }
+    direct += sun_direct;
 #endif
 #ifdef FLUTTER_SCENE_PHYSICAL_MATERIAL
     coat_direct += EvaluateClearcoatLight(

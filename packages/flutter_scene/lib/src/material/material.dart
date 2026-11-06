@@ -869,6 +869,12 @@ abstract class Material {
   @internal
   bool get depthAlphaMasked => false;
 
+  /// Whether this masked material tests its cutoff in its own color shader,
+  /// so the main pass draws it once instead of taking the coverage pre-draw.
+  /// See [PhysicallyBasedMaterial.alphaMaskInShader].
+  @internal
+  bool get cutsOutInShader => false;
+
   /// The material's own fragment for a depth-writing pass, or null to use
   /// the engine's. A cutout `.fmat` supplies one that runs its `Surface()` and
   /// drops what it leaves uncovered, so the depth prepass and shadow maps

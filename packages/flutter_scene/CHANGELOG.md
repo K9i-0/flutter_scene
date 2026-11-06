@@ -1,6 +1,7 @@
 ## 0.24.4
 
 * Fork: `BloomSettings.mipCount` selects 3–6 levels. Four levels use seven passes instead of eleven, preserving constant-input brightness with a tighter glow.
+* Fork: `PhysicallyBasedMaterial.alphaMaskInShader` lets a masked material test its cutoff in its color shader (eight `StandardMasked*Fragment` variants), so the main pass draws it once instead of a coverage pre-draw plus an equal-depth color draw. It trades early depth testing on that material for one draw call per cutout; foliage-heavy scenes on Pixel 7 drew about 20 fewer draws a frame and spent about 2 ms less encoding.
 * Fork: GPU-completion retries no longer bypass `SceneView.maxFrameRate` while auto-ticking. External repaint drivers can set `repaintOnGpuCompletion: false` to retain control of their cadence.
 
 * glTF imports read `EXT_texture_webp` textures, so a model whose textures are only WebP loads instead of failing.

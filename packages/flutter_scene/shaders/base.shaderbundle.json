@@ -354,5 +354,37 @@
   "DisplayReferredCompositeFragment": {
     "type": "fragment",
     "file": "shaders/flutter_scene_display_referred_composite.frag"
+  },
+  "StandardMaskedFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_masked.frag"
+  },
+  "StandardMaskedCubeFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_masked_cube.frag"
+  },
+  "StandardMaskedNoShadowFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_masked_no_shadow.frag"
+  },
+  "StandardMaskedNoShadowCubeFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_masked_no_shadow_cube.frag"
+  },
+  "StandardMaskedLeanFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_masked_lean.frag"
+  },
+  "StandardMaskedLeanCubeFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_masked_lean_cube.frag"
+  },
+  "StandardMaskedLeanNoShadowFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_masked_lean_no_shadow.frag"
+  },
+  "StandardMaskedLeanNoShadowCubeFragment": {
+    "type": "fragment",
+    "file": "shaders/flutter_scene_standard_masked_lean_no_shadow_cube.frag"
   }
 }

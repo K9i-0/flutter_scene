@@ -427,7 +427,29 @@ class PhysicallyBasedMaterial extends Material {
     if (_alphaMode == value) return;
     _alphaMode = value;
     _markMaterialDataDirty();
+    _updateStandardShaderNames();
   }
+
+  /// Opt-in for [AlphaMode.mask]: test the cutoff in the color shader and draw
+  /// once, instead of the main pass's coverage pre-draw followed by an
+  /// equal-depth color draw. The discard turns off early depth testing for
+  /// this material's draws only, so it suits CPU-bound scenes with many
+  /// cutout surfaces (foliage on mobile), where the extra draw call costs more
+  /// than the lost hidden-surface removal. Depth and shadow passes are
+  /// unchanged. Ignored for lightmapped materials.
+  bool get alphaMaskInShader => _alphaMaskInShader;
+  bool _alphaMaskInShader = false;
+  set alphaMaskInShader(bool value) {
+    if (_alphaMaskInShader == value) return;
+    _alphaMaskInShader = value;
+    _updateStandardShaderNames();
+  }
+
+  @override
+  bool get cutsOutInShader =>
+      _alphaMaskInShader &&
+      _alphaMode == AlphaMode.mask &&
+      !_usesLightmapVariant;
 
   /// Alpha-test threshold used when [alphaMode] is [AlphaMode.mask]:
   /// fragments whose alpha falls below this are discarded.
@@ -1126,16 +1148,27 @@ class PhysicallyBasedMaterial extends Material {
   // The standard-path entry pair, swapped when a lightmap is bound so the
   // shader that samples it is also the one the lightmap is bound to.
   bool _standardShaderNamesLightmapped = false;
+  bool _standardShaderNamesMasked = false;
 
   void _updateStandardShaderNames() {
     final lightmapped = _usesLightmapVariant;
-    if (lightmapped == _standardShaderNamesLightmapped) return;
+    final masked = cutsOutInShader;
+    if (lightmapped == _standardShaderNamesLightmapped &&
+        masked == _standardShaderNamesMasked) {
+      return;
+    }
     _standardShaderNamesLightmapped = lightmapped;
-    _setStandardShaderNames(lightmapped: lightmapped);
+    _standardShaderNamesMasked = masked;
+    _setStandardShaderNames(lightmapped: lightmapped, masked: masked);
   }
 
-  void _setStandardShaderNames({required bool lightmapped}) {
-    final prefix = lightmapped ? 'StandardLightmap' : 'Standard';
+  void _setStandardShaderNames({
+    required bool lightmapped,
+    bool masked = false,
+  }) {
+    final prefix = lightmapped
+        ? 'StandardLightmap'
+        : (masked ? 'StandardMasked' : 'Standard');
     setFragmentShaderName(
       '${prefix}Fragment',
       cubeName: '${prefix}CubeFragment',

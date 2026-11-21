@@ -8,8 +8,11 @@ import 'package:vector_math/vector_math.dart' show Matrix4, Vector3;
 
 import 'package:flutter_scene/src/render/depth_raster.dart';
 import 'package:flutter_scene/src/fmat/fmat_ast.dart' show DepthSurfaceKind;
+import 'package:flutter_scene/src/generated_assets/generated_assets.dart'
+    show debugViewsEntrySuffix;
 import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
 import 'package:flutter_scene/src/geometry/geometry.dart';
+import 'package:flutter_scene/src/generated_assets/lighting_features.dart';
 import 'package:flutter_scene/src/light.dart';
 import 'package:flutter_scene/src/material/dfg_lut.dart';
 import 'package:flutter_scene/src/material/dfg_lut_data.dart';
@@ -52,6 +55,23 @@ gpu.Texture? resolveTextureSource(TextureSource? source) =>
 @internal
 gpu.SamplerOptions? textureSourceSampler(TextureSource? source) =>
     source?.sampledSampler;
+
+/// The sampler a shared placeholder texture binds with.
+///
+/// GLES keeps sampler state on the texture object, so a placeholder bound to
+/// several slots of one draw is sampled with whichever sampler was applied
+/// last. Point sampling reads its single texel exactly, so binding every
+/// placeholder this way keeps each slot's result independent of bind order.
+@internal
+final gpu.SamplerOptions placeholderSampler = gpu.SamplerOptions();
+
+/// [sampler], or [placeholderSampler] when [texture] is null and a
+/// placeholder fills the slot.
+@internal
+gpu.SamplerOptions samplerOrPlaceholder(
+  gpu.Texture? texture,
+  gpu.SamplerOptions sampler,
+) => texture == null ? placeholderSampler : sampler;
 
 /// Base class for shading a [MeshPrimitive].
 ///
@@ -391,7 +411,7 @@ abstract class Material {
   gpu.Shader get fragmentShader {
     final resolved = _fragmentShader ??= _fragmentShaderName == null
         ? null
-        : baseShaderLibrary[_fragmentShaderName!];
+        : _baseShader(_fragmentShaderName!);
     if (resolved == null) {
       throw Exception('Fragment shader has not been set');
     }
@@ -478,8 +498,9 @@ abstract class Material {
   // inside the first draw that uses it, so there is nothing to wait on; a
   // runtime tier switch costs that draw's frame unless warmUp compiled both
   // tiers (Scene.warmUp's allShadingTiers).
-  // TODO(lean-lighting-pruning): a hook user-define that leaves the full or
-  // the lean entries out of the bundle for apps that never need them.
+  // TODO(lean-lighting-pruning): leave the lean twins out of the bundle when
+  // `lighting_features` compiles out all six features, since the full entries
+  // are then identical.
   @internal
   bool usesLeanVariant(Lighting lighting) {
     final lean = _leanShaders;
@@ -489,7 +510,11 @@ abstract class Material {
     if (override != null) return override;
     if (!lighting.allowsLeanShading) return false;
     final env = drawEnvironment(lighting);
-    return env.parallaxBoxCenter == null || env.parallaxBoxHalfExtents == null;
+    return env.parallaxBoxCenter == null ||
+        env.parallaxBoxHalfExtents == null ||
+        compiledOutLightingFeatures.contains(
+          LightingFeature.parallaxReflection,
+        );
   }
 
   gpu.Shader? _radianceCubeFragmentShader;
@@ -518,7 +543,7 @@ abstract class Material {
   gpu.Shader? get radianceCubeFragmentShader =>
       _radianceCubeFragmentShader ??= _radianceCubeFragmentShaderName == null
       ? null
-      : baseShaderLibrary[_radianceCubeFragmentShaderName!];
+      : _baseShader(_radianceCubeFragmentShaderName!);
 
   /// Whether this material draws with its cubemap-radiance variant for
   /// [lighting], which is also what decides the radiance texture bound to it.
@@ -543,7 +568,7 @@ abstract class Material {
   gpu.Shader? get noShadowFragmentShader =>
       _noShadowFragmentShader ??= _noShadowFragmentShaderName == null
       ? null
-      : baseShaderLibrary[_noShadowFragmentShaderName!];
+      : _baseShader(_noShadowFragmentShaderName!);
 
   /// The `FLUTTER_SCENE_SKIP_SHADOWS` twin of [radianceCubeFragmentShader],
   /// or null when this material carries none.
@@ -552,7 +577,7 @@ abstract class Material {
       _noShadowRadianceCubeFragmentShader ??=
           _noShadowRadianceCubeFragmentShaderName == null
           ? null
-          : baseShaderLibrary[_noShadowRadianceCubeFragmentShaderName!];
+          : _baseShader(_noShadowRadianceCubeFragmentShaderName!);
 
   /// Whether [fragmentShaderForLighting] picks a no-shadow twin for
   /// [lighting], which is also what decides whether the `shadow_map` sampler
@@ -571,8 +596,17 @@ abstract class Material {
   /// The radiance-layout variant wins over the shadow one: a shadow variant
   /// in the wrong layout would be handed a texture its sampler cannot read,
   /// while dropping the no-shadow variant only costs dead shadow code.
+  ///
+  /// While a surface debug view may show ([Lighting.surfaceDebugViews]), a
+  /// shader from [baseShaderLibrary] gives way to its twin built with the
+  /// views, when the bundle has one.
   @internal
   gpu.Shader fragmentShaderForLighting(Lighting lighting) {
+    final shader = _fragmentShaderForLighting(lighting);
+    return lighting.surfaceDebugViews ? _debugViewsTwin(shader) : shader;
+  }
+
+  gpu.Shader _fragmentShaderForLighting(Lighting lighting) {
     final noShadow = usesNoShadowVariant(lighting);
     final cube = usesRadianceCubeVariant(lighting);
     if (usesLeanVariant(lighting)) {
@@ -907,6 +941,29 @@ abstract class Material {
   ) {}
 }
 
+// The entry each base library shader was resolved from, and its twin built
+// with the surface debug views (itself when the bundle has none).
+final Expando<String> _baseShaderNames = Expando('base shader name');
+final Expando<gpu.Shader> _debugViewsTwins = Expando('debug views twin');
+
+gpu.Shader? _baseShader(String name) {
+  final shader = baseShaderLibrary[name];
+  if (shader != null) _baseShaderNames[shader] = name;
+  return shader;
+}
+
+gpu.Shader _debugViewsTwin(gpu.Shader shader) {
+  final cached = _debugViewsTwins[shader];
+  if (cached != null) return cached;
+  final name = _baseShaderNames[shader];
+  final twin =
+      (name == null
+          ? null
+          : baseShaderLibrary['$name$debugViewsEntrySuffix']) ??
+      shader;
+  return _debugViewsTwins[shader] = twin;
+}
+
 // The lean twins of a material's four standard entries, resolved on first use.
 class _LeanFragmentShaders {
   _LeanFragmentShaders(
@@ -926,11 +983,11 @@ class _LeanFragmentShaders {
   gpu.Shader? _noShadow;
   gpu.Shader? _noShadowCube;
 
-  gpu.Shader? get base => _base ??= baseShaderLibrary[_name];
-  gpu.Shader? get cube => _cube ??= baseShaderLibrary[_cubeName];
-  gpu.Shader? get noShadow => _noShadow ??= baseShaderLibrary[_noShadowName];
+  gpu.Shader? get base => _base ??= _baseShader(_name);
+  gpu.Shader? get cube => _cube ??= _baseShader(_cubeName);
+  gpu.Shader? get noShadow => _noShadow ??= _baseShader(_noShadowName);
   gpu.Shader? get noShadowCube =>
-      _noShadowCube ??= baseShaderLibrary[_noShadowCubeName];
+      _noShadowCube ??= _baseShader(_noShadowCubeName);
 
   /// Whether the bundle carries all four. Asked only at draw time, after the
   /// base bundle has loaded.

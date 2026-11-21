@@ -39,9 +39,15 @@ final class _WebGpuDeviceBuffer extends DeviceBuffer {
          ),
        ) {
     if (shadowed) {
-      // JS-backed, so handing it to writeBuffer is free under dart2wasm too.
-      _shadowJs = JSUint8Array.withLength(buffer.size);
-      _shadow = _shadowJs!.toDart;
+      // Word storage, since dart2wasm hands typed data to JS one element at a
+      // time. Writing into a JS-backed shadow instead boxes every byte.
+      final words = Uint32List(buffer.size >> 2);
+      _shadowWords = words;
+      if (kIsWasm) {
+        _shadowByteData = ByteData.sublistView(words);
+      } else {
+        _shadowBytes = words.buffer.asUint8List();
+      }
     }
     _bufferFinalizer.attach(this, buffer, detach: this);
   }
@@ -50,10 +56,18 @@ final class _WebGpuDeviceBuffer extends DeviceBuffer {
   _WebGpuDeviceBuffer.geometry(_WebGpuContext context, int sizeInBytes)
     : this._(context, StorageMode.hostVisible, sizeInBytes, shadowed: false);
 
+  static int _nextId = 1;
+
+  /// Monotonic integer identity for unboxed bind-group cache keys.
+  final int _id = _nextId++;
+
   final _WebGpuContext _context;
   final GPUBuffer buffer;
-  JSUint8Array? _shadowJs;
-  Uint8List? _shadow;
+  Uint32List? _shadowWords;
+  // A byte view of the shadow for dart2js, where it shares the JS buffer.
+  Uint8List? _shadowBytes;
+  // The view dart2wasm writes unaligned head and tail bytes through.
+  ByteData? _shadowByteData;
 
   @override
   final StorageMode storageMode;
@@ -92,8 +106,8 @@ final class _WebGpuDeviceBuffer extends DeviceBuffer {
     if (offset + length > sizeInBytes) return false;
     if (length == 0) return true;
     final queue = _context.device.device.queue;
-    final shadow = _shadow;
-    if (shadow == null) {
+    final shadowWords = _shadowWords;
+    if (shadowWords == null) {
       if (offset & 3 != 0) {
         throw StateError(
           'A geometry buffer write must start 4-byte aligned (offset $offset).',
@@ -102,25 +116,91 @@ final class _WebGpuDeviceBuffer extends DeviceBuffer {
       if (length & 3 == 0) {
         queue.writeBuffer(buffer, offset, _jsViewOf(source));
       } else {
-        final padded = Uint8List(_align4(length))
-          ..setRange(
+        final paddedWords = Uint32List(_align4(length) >> 2);
+        if (kIsWasm) {
+          _copyWords(
+            paddedWords,
+            ByteData.sublistView(paddedWords),
+            0,
+            source,
+            length,
+          );
+        } else {
+          paddedWords.buffer.asUint8List().setRange(
             0,
             length,
             source.buffer.asUint8List(source.offsetInBytes, length),
           );
-        queue.writeBuffer(buffer, offset, padded.toJS);
+        }
+        queue.writeBuffer(buffer, offset, paddedWords.toJS);
       }
       return true;
     }
-    shadow.setRange(
-      offset,
-      offset + length,
-      source.buffer.asUint8List(source.offsetInBytes, length),
-    );
+
+    if (kIsWasm) {
+      _copyWords(shadowWords, _shadowByteData!, offset, source, length);
+    } else {
+      _shadowBytes!.setRange(
+        offset,
+        offset + length,
+        source.buffer.asUint8List(source.offsetInBytes, length),
+      );
+    }
     final start = offset & ~3;
     final end = _align4(offset + length);
-    queue.writeBuffer(buffer, start, _shadowJs!, start, end - start);
+    final span = Uint32List.sublistView(shadowWords, start >> 2, end >> 2);
+    queue.writeBuffer(buffer, start, span.toJS);
     return true;
+  }
+
+  /// Copies [length] bytes of [source] to [dstOffset] in [dstWords] a word at
+  /// a time, through [dstBytes] (a view of [dstWords]) for unaligned ends.
+  ///
+  /// Under dart2wasm this is about 7x faster than a byte `setRange` into the
+  /// same words. Words are copied as integers, never floats, so NaN payloads
+  /// survive.
+  static void _copyWords(
+    Uint32List dstWords,
+    ByteData dstBytes,
+    int dstOffset,
+    TypedData source,
+    int length,
+  ) {
+    if ((dstOffset & 3) == 0 && (length & 3) == 0) {
+      final dstWordBase = dstOffset >> 2;
+      final wordCount = length >> 2;
+      if (source is Uint32List) {
+        dstWords.setRange(dstWordBase, dstWordBase + wordCount, source);
+        return;
+      }
+      final data = source is ByteData ? source : ByteData.sublistView(source);
+      for (var i = 0; i < wordCount; i++) {
+        dstWords[dstWordBase + i] = data.getUint32(i << 2, Endian.host);
+      }
+      return;
+    }
+
+    final data = source is ByteData ? source : ByteData.sublistView(source);
+    final endOffset = dstOffset + length;
+    var dstPos = dstOffset;
+    var srcPos = 0;
+    while (dstPos < endOffset && (dstPos & 3) != 0) {
+      dstBytes.setUint8(dstPos, data.getUint8(srcPos));
+      dstPos++;
+      srcPos++;
+    }
+    final middleWords = (endOffset - dstPos) >> 2;
+    var dstWord = dstPos >> 2;
+    for (var i = 0; i < middleWords; i++) {
+      dstWords[dstWord + i] = data.getUint32(srcPos, Endian.host);
+      srcPos += 4;
+    }
+    dstPos += middleWords << 2;
+    while (dstPos < endOffset) {
+      dstBytes.setUint8(dstPos, data.getUint8(srcPos));
+      dstPos++;
+      srcPos++;
+    }
   }
 
   /// Hands [source] to JS without a copy when its static type matches its
@@ -131,10 +211,23 @@ final class _WebGpuDeviceBuffer extends DeviceBuffer {
     Uint16List() => source.toJS,
     Uint32List() => source.toJS,
     Uint8List() => source.toJS,
-    _ => Uint8List.fromList(
-      source.buffer.asUint8List(source.offsetInBytes, source.lengthInBytes),
-    ).toJS,
+    Int8List() => source.toJS,
+    Int16List() => source.toJS,
+    Int32List() => source.toJS,
+    _ => _copyTypedDataToJs(source),
   };
+
+  /// Copies [source], whose length is a multiple of 4, into a list JS can
+  /// take as is.
+  static JSObject _copyTypedDataToJs(TypedData source) {
+    final length = source.lengthInBytes;
+    if (!kIsWasm) {
+      return source.buffer.asUint8List(source.offsetInBytes, length).toJS;
+    }
+    final words = Uint32List(length >> 2);
+    _copyWords(words, ByteData.sublistView(words), 0, source, length);
+    return words.toJS;
+  }
 
   /// Host writes reach the GPU through the queue; there is nothing to flush.
   @override

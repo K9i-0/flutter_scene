@@ -376,7 +376,8 @@ final class _BindingLayout {
     : dynamic = [
         for (final e in entries)
           if (e.dynamic) e.binding,
-      ];
+      ],
+      keyLength = _computeKeyLength(entries);
 
   /// The canonical descriptor text it was deduplicated by.
   final String key;
@@ -391,29 +392,21 @@ final class _BindingLayout {
   /// offset, so their bind group changes with the buffer range.
   final List<int> dynamic;
 
-  /// Bind groups made for this layout, by the resources in them.
-  final Map<_GroupKey, GPUBindGroup> groups = {};
-}
+  /// Number of `uint32` words in a bind-group cache key for [entries].
+  final int keyLength;
 
-/// The resources of one bind group: Dart objects and ints only, so it hashes
-/// without touching JS.
-final class _GroupKey {
-  _GroupKey(this.parts) : hashCode = Object.hashAll(parts);
+  /// Bind groups made for this layout, keyed by unboxed resource/sampler IDs.
+  final IntTupleCache<GPUBindGroup> groups = IntTupleCache(maxEntries: 1024);
 
-  final List<Object> parts;
-
-  @override
-  final int hashCode;
-
-  @override
-  bool operator ==(Object other) {
-    if (other is! _GroupKey || other.hashCode != hashCode) return false;
-    final a = other.parts;
-    if (a.length != parts.length) return false;
-    for (var i = 0; i < parts.length; i++) {
-      if (!identical(a[i], parts[i]) && a[i] != parts[i]) return false;
+  static int _computeKeyLength(List<_LayoutEntry> entries) {
+    var total = 0;
+    for (final e in entries) {
+      total += switch (e.kind) {
+        _EntryKind.uniform => e.dynamic ? 2 : 3,
+        _EntryKind.texture || _EntryKind.sampler => 1,
+      };
     }
-    return true;
+    return total;
   }
 }
 
@@ -447,7 +440,12 @@ final class _RefusedPipeline implements Exception {
 }
 
 /// A texture a pipeline samples, in the order its sample signature lists it.
-typedef _SampledTexture = ({_WebGpuShader shader, _TextureSlot slot});
+typedef _SampledTexture = ({
+  _WebGpuShader shader,
+  _TextureSlot slot,
+  int binding,
+  int defaultCode,
+});
 
 final class _WebGpuRenderPipeline extends RenderPipeline {
   _WebGpuRenderPipeline(
@@ -455,7 +453,7 @@ final class _WebGpuRenderPipeline extends RenderPipeline {
     this.vertexShader,
     this.fragmentShader,
     this.vertexLayout,
-  ) {
+  ) : vertexSlotCount = vertexLayout?.buffers.length ?? 1 {
     if (vertexShader.stage != ShaderStage.vertex ||
         fragmentShader.stage != ShaderStage.fragment) {
       throw Exception(
@@ -479,6 +477,9 @@ final class _WebGpuRenderPipeline extends RenderPipeline {
   /// interleaved buffer.
   final VertexLayout? vertexLayout;
 
+  /// Number of vertex buffer slots this pipeline expects.
+  final int vertexSlotCount;
+
   final Map<_VariantKey, _PipelineVariant> _variants = {};
   int _vertexGeneration = -1;
   int _fragmentGeneration = -1;
@@ -487,20 +488,25 @@ final class _WebGpuRenderPipeline extends RenderPipeline {
   String? _interfaceMismatch;
   late List<Map<String, Object?>> _vertexBuffers;
   late List<_SampledTexture> _sampled;
+  late Int32List _uniformSizes;
+
+  // The last single-target variant drawn, with the raw state that chose it.
+  _TargetShape? _mruTarget;
+  int _mruRaster = -1;
+  int _mruStencil = -1;
+  int _mruStencilMasks = -1;
+  int _mruBlend0 = -1;
+  int _mruSamples = -1;
+  _PipelineVariant? _mruVariant;
 
   /// The size a uniform block at [binding] binds with, from either stage.
   ///
   /// Rounded up to 16 bytes: the reflection can stop at the last member
   /// (60 bytes, say) while WGSL pads a uniform struct to its 16-byte
   /// alignment, and WebGPU rejects a binding smaller than the padded struct.
-  int uniformSize(int binding) {
-    for (final shader in [vertexShader, fragmentShader]) {
-      for (final block in shader.uniforms.values) {
-        if (block.binding == binding) return (block.size + 15) & ~15;
-      }
-    }
-    return 16;
-  }
+  int uniformSize(int binding) => binding >= 0 && binding < _uniformSizes.length
+      ? _uniformSizes[binding]
+      : 16;
 
   /// The textures this pipeline samples, in signature order. A pass resolves
   /// one [GpuSampleSlot] per entry.
@@ -516,15 +522,97 @@ final class _WebGpuRenderPipeline extends RenderPipeline {
       return;
     }
     _vertexBuffers = _buildVertexBuffers();
+    final f32 = _context.float32Filterable;
     _sampled = [
       for (final shader in [vertexShader, fragmentShader])
         for (final slot in shader.textures)
-          if (slot.shape != null) (shader: shader, slot: slot),
+          if (slot.shape != null)
+            (
+              shader: shader,
+              slot: slot,
+              binding: slot.binding,
+              defaultCode: resolveSampleSlotCode(
+                shape: slot.shape!,
+                formatDepth: false,
+                formatFloat32: false,
+                samplerFilters: true,
+                float32Filterable: f32,
+              ),
+            ),
     ];
+
+    var maxUniformBinding = -1;
+    for (final block in vertexShader.uniforms.values) {
+      if (block.binding > maxUniformBinding) maxUniformBinding = block.binding;
+    }
+    for (final block in fragmentShader.uniforms.values) {
+      if (block.binding > maxUniformBinding) maxUniformBinding = block.binding;
+    }
+    final sizes = Int32List(maxUniformBinding + 1);
+    for (var i = 0; i < sizes.length; i++) {
+      sizes[i] = 16;
+    }
+    for (final block in fragmentShader.uniforms.values) {
+      sizes[block.binding] = (block.size + 15) & ~15;
+    }
+    for (final block in vertexShader.uniforms.values) {
+      sizes[block.binding] = (block.size + 15) & ~15;
+    }
+    _uniformSizes = sizes;
+
     _interfaceMismatch = _checkVaryings();
     _variants.clear();
+    _mruVariant = null;
+    _mruTarget = null;
     _vertexGeneration = vertexShader.generation;
     _fragmentGeneration = fragmentShader.generation;
+  }
+
+  /// The variant for a draw with [state] into [target], whose sampled
+  /// textures resolved to the codes packed in [samples].
+  _PipelineVariant variantForLanes(
+    _RenderState state,
+    _TargetShape target,
+    GpuSampleLanes samples,
+  ) {
+    _refresh();
+    if (_interfaceMismatch case final mismatch?) {
+      throw _RefusedPipeline(mismatch);
+    }
+    // Consecutive draws of a pipeline nearly always repeat their state, so
+    // the common single-target case skips building a key.
+    final mruEligible =
+        target.colorFormats.length == 1 && samples.overflowCount == 0;
+    if (mruEligible &&
+        identical(_mruTarget, target) &&
+        _mruRaster == state.raster &&
+        _mruStencil == state.stencil &&
+        _mruStencilMasks == state.stencilMasks &&
+        _mruBlend0 == state.blends[0] &&
+        _mruSamples == samples.primary) {
+      return _checkVariant(_mruVariant!);
+    }
+    final signature = samples.toSignature();
+    final key = _VariantKey(
+      state,
+      target,
+      signature,
+      float32Blendable: _context.float32Blendable,
+    );
+    final variant = _variants[key] ??= _build(key, [
+      for (var i = 0; i < _sampled.length; i++)
+        sampleSlotFromCode(signature.codeAt(i)),
+    ]);
+    if (mruEligible) {
+      _mruTarget = target;
+      _mruRaster = state.raster;
+      _mruStencil = state.stencil;
+      _mruStencilMasks = state.stencilMasks;
+      _mruBlend0 = state.blends[0];
+      _mruSamples = samples.primary;
+      _mruVariant = variant;
+    }
+    return _checkVariant(variant);
   }
 
   /// The variant for a draw with [state] into [target], whose sampled
@@ -534,17 +622,20 @@ final class _WebGpuRenderPipeline extends RenderPipeline {
     _TargetShape target,
     List<GpuSampleSlot> slots,
   ) {
-    _refresh();
-    if (_interfaceMismatch case final mismatch?) {
-      throw _RefusedPipeline(mismatch);
+    if (slots.length != _sampled.length) {
+      throw ArgumentError(
+        'Expected ${_sampled.length} resolved texture slots, got '
+        '${slots.length}.',
+      );
     }
-    final key = _VariantKey(
-      state,
-      target,
-      GpuSampleSignature(slots),
-      float32Blendable: _context.float32Blendable,
-    );
-    final variant = _variants[key] ??= _build(key, slots);
+    final samples = GpuSampleLanes();
+    for (final slot in slots) {
+      samples.add(sampleSlotCode(slot));
+    }
+    return variantForLanes(state, target, samples);
+  }
+
+  _PipelineVariant _checkVariant(_PipelineVariant variant) {
     // A variant still pending validation is drawn with. Skipping it would
     // leave a one-shot render (an environment prefilter, a capture) with
     // nothing in it, and the stage interface, the usual reason a pairing is
@@ -629,12 +720,13 @@ final class _WebGpuRenderPipeline extends RenderPipeline {
         },
     ];
     for (var i = 0; i < _sampled.length; i++) {
-      final (:shader, :slot) = _sampled[i];
+      final sampled = _sampled[i];
+      final slot = sampled.slot;
       final shape = slot.shape!;
       final resolved = slots[i];
       entries.add({
         'binding': slot.binding,
-        'visibility': _visibility(shader),
+        'visibility': _visibility(sampled.shader),
         'texture': {
           'sampleType': resolved.sampleType.webGpuName,
           'viewDimension': shape.viewDimension.webGpuName,
@@ -644,7 +736,7 @@ final class _WebGpuRenderPipeline extends RenderPipeline {
       if (slot.samplerDeclared) {
         entries.add({
           'binding': slot.sampler,
-          'visibility': _visibility(shader),
+          'visibility': _visibility(sampled.shader),
           'sampler': {'type': resolved.samplerType.webGpuName},
         });
       }

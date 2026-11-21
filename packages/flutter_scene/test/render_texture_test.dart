@@ -186,6 +186,42 @@ void main() {
     expect(notified, 1);
   });
 
+  testWidgets('dispose releases the render targets a texture view held', (
+    tester,
+  ) async {
+    await tester.runAsync(Scene.initializeStaticResources);
+
+    final scene = Scene();
+    addTearDown(scene.dispose);
+    final target = RenderTexture(width: 64, height: 64);
+    final view = RenderView(
+      camera: PerspectiveCamera(position: Vector3(0, 0, 5)),
+      target: target,
+    );
+    scene.views.add(view);
+
+    final recorder = ui.PictureRecorder();
+    scene.render(
+      PerspectiveCamera(position: Vector3(0, 0, 5)),
+      ui.Canvas(recorder),
+      viewport: const ui.Rect.fromLTWH(0, 0, 32, 32),
+      pixelRatio: 1.0,
+    );
+    recorder.endRecording();
+
+    int renderTargetBytes() => takeMemoryReport().categories
+        .singleWhere((category) => category.name == 'render targets')
+        .bytes!;
+    final held = renderTargetBytes();
+    expect(target.texture, isNotNull);
+
+    scene.views.remove(view);
+    target.dispose();
+
+    expect(target.texture, isNull);
+    expect(renderTargetBytes(), lessThan(held));
+  });
+
   group('GPU pacing', () {
     if (!gpuAvailable()) return;
     final heldFrames = <int>[];
@@ -233,7 +269,7 @@ void main() {
       holdFrameInFlight();
 
       final target = RenderTexture(width: 16, height: 16);
-      final scene = textureViewScene(target);
+      final scene = textureViewScene(target)..maxGpuFramesInFlight = 1;
       addTearDown(scene.dispose);
       var rendered = 0;
       target.addListener(() => rendered++);
@@ -247,7 +283,7 @@ void main() {
         're-presents its previous image', (tester) async {
       await tester.runAsync(Scene.initializeStaticResources);
       final target = RenderTexture(width: 16, height: 16);
-      final scene = textureViewScene(target);
+      final scene = textureViewScene(target)..maxGpuFramesInFlight = 1;
       addTearDown(scene.dispose);
       var rendered = 0;
       target.addListener(() => rendered++);

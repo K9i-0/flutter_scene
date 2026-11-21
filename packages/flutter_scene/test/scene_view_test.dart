@@ -10,8 +10,12 @@
 import 'package:clock/clock.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_scene/scene.dart';
+// ignore: implementation_imports
+import 'package:flutter_scene/src/scene.dart' show notifySceneRepaintForTesting;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vector_math/vector_math.dart';
+
+import 'support/gpu_available.dart';
 
 /// Builds a [Scene], or returns null when no GPU/Impeller context is available.
 Scene? _tryScene() {
@@ -237,6 +241,215 @@ void main() {
     expect(tickCount, 0);
   });
 
+  testWidgets(
+    'repaintRequested under an active rate-limited ticker clears the deadline without dirtying out of band',
+    (tester) async {
+      final scene = _tryScene();
+      if (scene == null) {
+        markTestSkipped('No Impeller GPU context');
+        return;
+      }
+      var ticks = 0;
+      var paints = 0;
+      await tester.pumpWidget(
+        _sized(
+          SceneView(
+            scene,
+            maxFrameRate: 10, // 100 ms period; 75 ms earliest due threshold.
+            cameraBuilder: (_) {
+              paints++;
+              return PerspectiveCamera();
+            },
+            onTick: (_, _) => ticks++,
+          ),
+        ),
+      );
+      // First ticker callback sets the 100 ms deadline.
+      await tester.pump(const Duration(milliseconds: 10));
+      expect(ticks, 1);
+
+      // 16 ms into the period is rate-limited; neither tick nor paint runs.
+      await tester.pump(const Duration(milliseconds: 16));
+      final ticksBefore = ticks;
+      final paintsBefore = paints;
+      final paintBox = tester.renderObject(find.bySubtype<CustomPaint>());
+      expect(paintBox.debugNeedsPaint, isFalse);
+
+      // Firing repaintRequested must NOT dirty CustomPaint immediately, and
+      // must clear _frameDue so the very next vsync advances onTick early.
+      notifySceneRepaintForTesting(scene);
+      expect(paintBox.debugNeedsPaint, isFalse);
+
+      await tester.pump(const Duration(milliseconds: 16));
+      expect(ticks, ticksBefore + 1);
+      expect(paints, paintsBefore + 1);
+    },
+  );
+
+  testWidgets(
+    'repaintRequested marks CustomPaint dirty when autoTick is false',
+    (tester) async {
+      final scene = _tryScene();
+      if (scene == null) {
+        markTestSkipped('No Impeller GPU context');
+        return;
+      }
+      var ticks = 0;
+      var paints = 0;
+      await tester.pumpWidget(
+        _sized(
+          SceneView(
+            scene,
+            autoTick: false,
+            cameraBuilder: (_) {
+              paints++;
+              return PerspectiveCamera();
+            },
+            onTick: (_, _) => ticks++,
+          ),
+        ),
+      );
+      final paintsBefore = paints;
+      final paintBox = tester.renderObject(find.bySubtype<CustomPaint>());
+      expect(paintBox.debugNeedsPaint, isFalse);
+
+      notifySceneRepaintForTesting(scene);
+      expect(paintBox.debugNeedsPaint, isTrue);
+
+      await tester.pump();
+      expect(paints, paintsBefore + 1);
+      expect(ticks, 0);
+    },
+  );
+
+  testWidgets('turning autoTick back on continues the clock', (tester) async {
+    final scene = _tryScene();
+    if (scene == null) {
+      markTestSkipped('No Impeller GPU context');
+      return;
+    }
+    var now = DateTime(2026);
+    final ticks = <(Duration, double)>[];
+    Widget view({required bool autoTick}) => _sized(
+      SceneView(
+        scene,
+        camera: PerspectiveCamera(),
+        autoTick: autoTick,
+        clock: Clock(() => now),
+        onTick: (elapsed, deltaSeconds) => ticks.add((elapsed, deltaSeconds)),
+      ),
+    );
+    Future<void> frame() async {
+      now = now.add(const Duration(milliseconds: 16));
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+
+    await tester.pumpWidget(view(autoTick: true));
+    for (var i = 0; i < 4; i++) {
+      await frame();
+    }
+    final elapsedAtPause = ticks.last.$1;
+    expect(elapsedAtPause, greaterThan(Duration.zero));
+
+    // Ten seconds with the ticker off, as when an app pauses a hidden view.
+    await tester.pumpWidget(view(autoTick: false));
+    ticks.clear();
+    now = now.add(const Duration(seconds: 10));
+    await tester.pump(const Duration(seconds: 10));
+    expect(ticks, isEmpty);
+
+    await tester.pumpWidget(view(autoTick: true));
+    for (var i = 0; i < 3; i++) {
+      await frame();
+    }
+    expect(tester.takeException(), isNull);
+    expect(ticks, hasLength(3));
+    // The first tick continues from where the clock stopped, and the time
+    // spent off is not reported as one long step.
+    expect(ticks.first.$1, elapsedAtPause);
+    expect(ticks.first.$2, 0);
+    expect(ticks[1].$1, elapsedAtPause + const Duration(milliseconds: 16));
+    expect(ticks[1].$2, closeTo(0.016, 0.001));
+    expect(ticks[2].$1, elapsedAtPause + const Duration(milliseconds: 32));
+  });
+
+  testWidgets('turning autoTick back on keeps maxFrameRate pacing', (
+    tester,
+  ) async {
+    final scene = _tryScene();
+    if (scene == null) {
+      markTestSkipped('No Impeller GPU context');
+      return;
+    }
+    var count = 0;
+    Widget view({required bool autoTick}) => _sized(
+      SceneView(
+        scene,
+        camera: PerspectiveCamera(),
+        autoTick: autoTick,
+        maxFrameRate: 60,
+        onTick: (_, __) => count++,
+      ),
+    );
+
+    // Two seconds on, so the next frame's deadline sits two seconds into the
+    // ticker's time.
+    await tester.pumpWidget(view(autoTick: true));
+    for (var i = 0; i < 240; i++) {
+      await tester.pump(const Duration(microseconds: 8333));
+    }
+    await tester.pumpWidget(view(autoTick: false));
+    await tester.pump(const Duration(seconds: 1));
+
+    // One second back on at 120 Hz renders about sixty frames.
+    count = 0;
+    await tester.pumpWidget(view(autoTick: true));
+    for (var i = 0; i < 120; i++) {
+      await tester.pump(const Duration(microseconds: 8333));
+    }
+    expect(tester.takeException(), isNull);
+    expect(count, inInclusiveRange(58, 62));
+  });
+
+  testWidgets('a view that starts with autoTick off ticks once it is on', (
+    tester,
+  ) async {
+    final scene = _tryScene();
+    if (scene == null) {
+      markTestSkipped('No Impeller GPU context');
+      return;
+    }
+    var now = DateTime(2026);
+    final ticks = <(Duration, double)>[];
+    Widget view({required bool autoTick}) => _sized(
+      SceneView(
+        scene,
+        camera: PerspectiveCamera(),
+        autoTick: autoTick,
+        clock: Clock(() => now),
+        onTick: (elapsed, deltaSeconds) => ticks.add((elapsed, deltaSeconds)),
+      ),
+    );
+
+    await tester.pumpWidget(view(autoTick: false));
+    now = now.add(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    expect(ticks, isEmpty);
+
+    await tester.pumpWidget(view(autoTick: true));
+    for (var i = 0; i < 3; i++) {
+      now = now.add(const Duration(milliseconds: 16));
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    expect(tester.takeException(), isNull);
+    // The clock starts at zero, whatever time passed before the first tick.
+    expect(ticks, hasLength(3));
+    expect(ticks.first, (Duration.zero, 0.0));
+    expect(ticks[1].$1, const Duration(milliseconds: 16));
+    expect(ticks[1].$2, closeTo(0.016, 0.001));
+    expect(ticks[2].$1, const Duration(milliseconds: 32));
+  });
+
   testWidgets('disposes cleanly (no ticker leak)', (tester) async {
     final scene = _tryScene();
     if (scene == null) {
@@ -278,4 +491,79 @@ void main() {
     await tester.pumpWidget(_sized(const SizedBox()));
     expect(appScene.isDisposed, isFalse);
   });
+
+  testWidgets('errorBuilder shows a failed static load and retry recovers', (
+    tester,
+  ) async {
+    // Static resources never finish loading under a web `flutter test`.
+    if (!gpuAvailable()) {
+      markTestSkipped('No GPU rendering');
+      return;
+    }
+    final scene = Scene();
+    await tester.runAsync(Scene.initializeStaticResources);
+    Scene.debugFailNextStaticResourcesLoad(StateError('offline'));
+
+    VoidCallback? retry;
+    await tester.pumpWidget(
+      _sized(
+        SceneView(
+          scene,
+          camera: PerspectiveCamera(),
+          loadingBuilder: (_, _) => const Text('loading'),
+          errorBuilder: (context, error, onRetry) {
+            retry = onRetry;
+            return Text('failed: $error');
+          },
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(find.textContaining('offline'), findsOneWidget);
+    // Handed to the builder, not reported.
+    expect(tester.takeException(), isNull);
+
+    retry!();
+    await tester.pump();
+    expect(find.text('loading'), findsOneWidget);
+    await tester.runAsync(Scene.initializeStaticResources);
+    for (var i = 0; i < 10 && !_revealed(tester); i++) {
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    expect(Scene.isReadyToRender, isTrue);
+    expect(_revealed(tester), isTrue);
+    expect(find.textContaining('offline'), findsNothing);
+  });
+
+  testWidgets('without errorBuilder a failed static load is reported', (
+    tester,
+  ) async {
+    // Static resources never finish loading under a web `flutter test`.
+    if (!gpuAvailable()) {
+      markTestSkipped('No GPU rendering');
+      return;
+    }
+    final scene = Scene();
+    await tester.runAsync(Scene.initializeStaticResources);
+    Scene.debugFailNextStaticResourcesLoad(StateError('offline'));
+    addTearDown(() => tester.runAsync(Scene.initializeStaticResources));
+
+    await tester.pumpWidget(
+      _sized(
+        SceneView(
+          scene,
+          camera: PerspectiveCamera(),
+          loadingBuilder: (_, _) => const Text('loading'),
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(tester.takeException(), isA<StateError>());
+    expect(find.text('loading'), findsOneWidget);
+  });
 }
+
+// Whether the view has swapped its loading or error widget for the scene.
+bool _revealed(WidgetTester tester) =>
+    find.text('loading').evaluate().isEmpty &&
+    find.textContaining('failed').evaluate().isEmpty;

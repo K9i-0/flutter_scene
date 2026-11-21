@@ -41,6 +41,9 @@ dependencies:
   collection: ^1.19.0
   crypto: ^3.0.0
   data_assets: ^0.20.0
+  # Native only: states the render targets a scene holds to the VM as
+  # external memory.
+  ffi: ^2.1.0
   # Reader for the bundled GPU shim's shader-bundle flatbuffer.
   flat_buffers: ^25.9.23
   flutter:
@@ -57,6 +60,8 @@ dependencies:
   # for HDR environment maps. WASM-safe (no dart:io/dart:html on its web graph).
   image: ^4.5.0
   logging: ^1.2.0
+  # Annotations for code the Flutter-free build hook also compiles.
+  meta: ^1.15.0
   vector_math: ^2.1.4
   # WebGL2 bindings for the web GPU backend.
   web: ^1.1.0

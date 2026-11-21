@@ -16,10 +16,14 @@ import 'package:flutter_scene/src/depth_conflicts.dart'
 import 'package:flutter_scene/src/render/depth_raster.dart';
 import 'package:flutter_scene/src/render/render_layers.dart';
 import 'package:flutter_scene/src/render/near_fit.dart';
+import 'package:flutter_scene/src/render/view_sizing.dart';
 import 'package:flutter_scene/src/render/viewport_camera.dart';
 import 'package:flutter_scene/src/render/projection_params.dart';
 import 'package:flutter_scene/src/render/debug_view.dart';
 import 'package:flutter_scene/src/render/frame_transients.dart';
+import 'package:flutter_scene/src/render/transients_execution_native.dart'
+    if (dart.library.js_interop) 'package:flutter_scene/src/render/transients_execution_web.dart'
+    show kImmediateGpuExecution;
 import 'package:flutter_scene/src/render/instance_packing.dart'
     show beginRetainedInstanceFrame;
 import 'package:flutter_scene/src/render/mip_sampling_probe.dart';
@@ -37,9 +41,7 @@ import 'components/camera_component.dart';
 import 'components/directional_light_component.dart';
 import 'components/irradiance_volume_component.dart';
 import 'components/planar_reflector_component.dart';
-import 'components/point_light_component.dart';
 import 'components/reflection_probe_component.dart';
-import 'components/spot_light_component.dart';
 import 'fog.dart';
 import 'god_rays.dart';
 import 'light.dart';
@@ -83,13 +85,16 @@ import 'render/render_graph_capture.dart';
 import 'render/render_stats.dart';
 import 'scene_encoder.dart'
     show
+        awaitPipelinesReady,
         beginDrawFailureFrame,
         deferredPipelineBuilds,
         pipelineCacheSize,
-        withPipelineBuildBudget;
+        withPipelineBuildBudget,
+        withUnreadyPipelinesHeld;
 import 'render/render_scene.dart';
 import 'render/planar_reflection.dart';
 import 'render/planar_reflection_pass.dart';
+import 'render/shadow_caster_selection.dart';
 import 'render/punctual_lights.dart';
 import 'render/point_shadow.dart';
 import 'render/spot_shadow.dart';
@@ -188,6 +193,19 @@ enum AntiAliasingMode {
   auto,
 }
 
+/// The default [Scene.maxGpuFramesInFlight] for this platform, 2 on iOS,
+/// macOS, and the WebGPU web backend, and 1 elsewhere.
+// TODO(gpu-pacing): Re-measure Android Vulkan once Flutter GPU submits off the
+// calling thread (flutter/flutter#194882), and measure Windows.
+@visibleForTesting
+int get defaultMaxGpuFramesInFlight {
+  if (kIsWeb) return kImmediateGpuExecution ? 1 : 2;
+  return switch (defaultTargetPlatform) {
+    TargetPlatform.iOS || TargetPlatform.macOS => 2,
+    _ => 1,
+  };
+}
+
 /// Represents a 3D scene, which is a collection of nodes that can be rendered onto the screen.
 ///
 /// `Scene` manages the scene graph and handles rendering operations.
@@ -215,6 +233,24 @@ base class Scene implements SceneGraph {
 
   static Future<void>? _initializeStaticResources;
   static bool _readyToRender = false;
+  static Object? _debugNextLoadError;
+
+  /// Forgets the loaded static resources and fails the next
+  /// [initializeStaticResources] with [error], for tests of a failed load.
+  @visibleForTesting
+  static void debugFailNextStaticResourcesLoad(Object error) {
+    _initializeStaticResources = null;
+    _readyToRender = false;
+    _debugNextLoadError = error;
+  }
+
+  static Future<void> _initializeGpuBackend() {
+    final error = _debugNextLoadError;
+    _debugNextLoadError = null;
+    return error == null
+        ? gpu.initializeGpuBackend()
+        : Future<void>.error(error);
+  }
 
   /// Whether the engine's shared shader libraries and material lookup
   /// resources have finished loading, so any scene can render this frame.
@@ -532,15 +568,15 @@ base class Scene implements SceneGraph {
   /// and that completes with the load's error when it fails. A failure also
   /// resets the resources and leaves the scene not ready to render, so a
   /// caller that awaits this without catching gets the error rather than a
-  /// misleading one from the first draw. `SceneView` reports it and stays on
-  /// its loading builder.
+  /// misleading one from the first draw. A later call retries. `SceneView`
+  /// passes it to its `errorBuilder`, or reports it and stays on its loading
+  /// builder.
   static Future<void> initializeStaticResources() {
     if (_initializeStaticResources != null) {
       return _initializeStaticResources!;
     }
     listenForMemoryPressure();
-    _initializeStaticResources = gpu
-        .initializeGpuBackend()
+    _initializeStaticResources = _initializeGpuBackend()
         .then(
           (_) => Future.wait([
             loadBaseShaderLibrary(),
@@ -601,56 +637,109 @@ base class Scene implements SceneGraph {
   int get punctualLightOverflowCount =>
       _punctualLightBuffer.overflowedItemCount;
 
-  // The lights that held a shadow slot last frame, by identity, plus how many
-  // asked for one and missed. Refreshed once per frame alongside the caster
-  // selection; empty until the first frame renders.
+  // The lights that held a shadow slot last frame, and the in-view ones that
+  // asked for one and missed, by identity. Refreshed once per frame alongside
+  // the caster selection; empty until the first frame renders.
   final Set<Object> _grantedShadowCasters = Set.identity();
-  int _shadowCasterOverflowCount = 0;
+  final Set<Object> _droppedShadowCasters = Set.identity();
 
   /// How many lights asked to cast a shadow last frame but got no slot in the
   /// shared shadow atlas, which caps shadow-casting spots and point lights
   /// separately (see `kMaxSpotShadows` and `kMaxPointShadows`).
   ///
-  /// Those lights still light the scene; they just throw no shadow, silently.
-  /// A nonzero value means the scene asks for more shadowed local lights than
-  /// the atlas holds, so some authored shadows are not being drawn.
+  /// Only lights whose range reaches what a view sees compete; the slots go
+  /// to the ones that appear largest. The losers still light the scene; they
+  /// just throw no shadow, silently. A nonzero value means more shadowed
+  /// local lights are in view than the atlas holds, so some authored shadows
+  /// are not being drawn.
   /// {@category Lighting and environment}
-  int get shadowCasterOverflowCount => _shadowCasterOverflowCount;
+  int get shadowCasterOverflowCount => _droppedShadowCasters.length;
 
   /// Whether [lightComponent] (a `SpotLightComponent` or
   /// `PointLightComponent`) held a shadow slot last frame.
   ///
-  /// False for a light that does not cast at all, and also for one whose
-  /// `castsShadow` is set but which lost the slot to the budget. Editors pair
-  /// this with [shadowCasterOverflowCount] to point at the specific lights
-  /// whose authored shadow is not being drawn.
+  /// False for a light that does not cast at all, one whose range misses
+  /// every view (its shadow could not be seen), and one that lost the slot to
+  /// the budget. [isShadowCasterDropped] picks out only the last.
   /// {@category Lighting and environment}
   bool isShadowCasterGranted(Object lightComponent) =>
       _grantedShadowCasters.contains(lightComponent);
 
+  /// Whether [lightComponent] (a `SpotLightComponent` or
+  /// `PointLightComponent`) asked for a shadow last frame, was in view, and
+  /// got no slot, one of the lights [shadowCasterOverflowCount] counts.
+  ///
+  /// Unlike a false [isShadowCasterGranted], this excludes lights whose
+  /// shadow could not have been seen anyway, so editors can flag exactly the
+  /// shadows the budget is hiding.
+  /// {@category Lighting and environment}
+  bool isShadowCasterDropped(Object lightComponent) =>
+      _droppedShadowCasters.contains(lightComponent);
+
   // Records this frame's caster selection for the two queries above.
   void _recordShadowCasterBudget({
-    required List<SpotLightComponent> spots,
-    required List<PointLightComponent> points,
     required SpotShadowFrame? spotShadows,
     required PointShadowFrame? pointShadows,
   }) {
     _grantedShadowCasters.clear();
-    final granted =
-        (spotShadows?.casters.length ?? 0) +
-        (pointShadows?.casters.length ?? 0);
-    if (spotShadows != null) _grantedShadowCasters.addAll(spotShadows.casters);
+    _droppedShadowCasters.clear();
+    if (spotShadows != null) {
+      _grantedShadowCasters.addAll(spotShadows.casters);
+      _droppedShadowCasters.addAll(spotShadows.dropped);
+    }
     if (pointShadows != null) {
       _grantedShadowCasters.addAll(pointShadows.casters);
+      _droppedShadowCasters.addAll(pointShadows.dropped);
     }
-    var requested = 0;
-    for (final spot in spots) {
-      if (spot.light.castsShadow) requested++;
+  }
+
+  // The union of what this frame's views see: every screen and texture view,
+  // their planar reflections, and any pending reflection-probe capture (which
+  // sees everything).
+  ShadowViewVolumes _shadowViewVolumes(
+    List<RenderView> views,
+    ui.Rect drawArea,
+  ) {
+    final eyes = <Vector3>[];
+    final frustums = <Frustum>[];
+    void add(Camera camera, ui.Size size) {
+      if (size.isEmpty) return;
+      eyes.add(camera.position);
+      frustums.add(cullingFrustumOf(camera, size));
     }
-    for (final point in points) {
-      if (point.light.castsShadow) requested++;
+
+    for (final view in this.views) {
+      final target = view.target;
+      if (target == null) continue;
+      add(
+        view.camera,
+        ui.Size(target.width.toDouble(), target.height.toDouble()),
+      );
     }
-    _shadowCasterOverflowCount = requested - granted;
+    for (final view in views) {
+      final target = view.target;
+      add(
+        view.camera,
+        target != null
+            ? ui.Size(target.width.toDouble(), target.height.toDouble())
+            : _viewDrawArea(drawArea, view.viewport).size,
+      );
+    }
+    var omnidirectional = false;
+    for (final probe in renderScene.reflectionProbeComponents) {
+      if (!probe.capturePending) continue;
+      omnidirectional = true;
+      eyes.add(probe.worldCenter);
+    }
+    return ShadowViewVolumes(
+      eyes: eyes,
+      frustums: omnidirectional ? null : frustums,
+      mirrors: [
+        for (final reflector in renderScene.planarReflectorComponents)
+          if (reflector.enabled && reflector.node.internalEffectiveVisible)
+            reflector.worldPlane(),
+      ],
+    );
   }
 
   /// Whether punctual lights shade through per-view froxel clustering (the
@@ -667,20 +756,28 @@ base class Scene implements SceneGraph {
   /// presents its previous image again instead of encoding a new frame.
   ///
   /// The Vulkan and Metal backends encode and queue GPU work on the thread
-  /// that calls [render]; when the GPU falls behind, queuing more work blocks
-  /// that thread for the backlog (the queue is serialized with the raster
-  /// thread's own submissions), so a GPU-bound scene stalls the UI thread
-  /// and everything else on it. Pacing instead re-presents the last frame
+  /// that calls [render]. Once the GPU falls behind, Android's Vulkan drivers
+  /// block that thread for the backlog (the queue is serialized with the
+  /// raster thread's own submissions), so a GPU-bound scene stalls the UI
+  /// thread and everything else on it. Pacing instead re-presents the last frame
   /// once [maxGpuFramesInFlight] frames are still running; the scene updates
   /// at the rate the GPU finishes frames, which it did anyway. Scene time
   /// still advances on a paced frame.
   ///
-  /// The default of 1 keeps the UI thread free and costs about a tenth of
-  /// GPU throughput on a saturated GPU. 2 keeps the throughput but only
-  /// halves the stall on drivers with shallow queues. Set to 0 to always
-  /// encode. Only screen views pace; render-to-texture views always render.
+  /// Defaults to 2 on iOS and macOS, where Metal queues a second frame
+  /// without stalling either thread. There a limit of 1 can halve the frame
+  /// rate of a scene the GPU has room for, since the GPU clocks down until
+  /// each frame barely fits a vsync and a held frame then misses the next.
+  /// It is also 2 on WebGPU, whose completion signal arrives a round trip
+  /// late, so a limit of 1 holds frames the GPU has already finished.
+  /// Elsewhere it defaults to 1. On Android's Vulkan backend a second frame
+  /// blocks this thread or the raster thread once the GPU falls behind, which
+  /// slows the whole app, and on GLES it gains little. An Android game whose
+  /// 3D view matters more than the rest of its UI can still set 2. Set to 0 to
+  /// always encode. Only screen views pace; render-to-texture views always
+  /// render.
   /// {@category Rendering}
-  int maxGpuFramesInFlight = 1;
+  int maxGpuFramesInFlight = defaultMaxGpuFramesInFlight;
 
   // The frame's shared spot and point shadow tiles while render() runs.
   SharedShadowAtlas? _sharedShadowAtlas;
@@ -1382,8 +1479,16 @@ base class Scene implements SceneGraph {
     }());
     renderScene.rebuildIfDirty();
     final lightComponent = renderScene.primaryDirectionalLight;
-    final spotShadowFrame = collectSpotShadows(renderScene.spotLights);
-    final pointShadowFrame = collectPointShadows(renderScene.pointLights);
+    // The capture sees every direction, so only distance ranks the casters.
+    final captureViews = ShadowViewVolumes(eyes: [position]);
+    final spotShadowFrame = collectSpotShadows(
+      renderScene.spotLights,
+      views: captureViews,
+    );
+    final pointShadowFrame = collectPointShadows(
+      renderScene.pointLights,
+      views: captureViews,
+    );
     final punctualLighting = _punctualLightBuffer.build(
       directionals: renderScene.directionalLights,
       primaryDirectional: lightComponent,
@@ -1718,6 +1823,13 @@ base class Scene implements SceneGraph {
   Iterable<CustomRenderPass> _passesAt(RenderStage stage) =>
       _renderPasses.where((p) => p.enabled && p.stage == stage);
 
+  // The enabled passes whose [CustomRenderPass.inputs] the engine produces:
+  // every stage but [RenderStage.beforeScene], which runs before any of them
+  // exists.
+  Iterable<CustomRenderPass> get _passesWithInputs => _renderPasses.where(
+    (p) => p.enabled && p.stage != RenderStage.beforeScene,
+  );
+
   /// Screen-space ambient occlusion settings. Off by default; set
   /// [AmbientOcclusionSettings.enabled] to turn it on. Works with perspective
   /// and orthographic cameras.
@@ -2043,9 +2155,11 @@ base class Scene implements SceneGraph {
   /// Awaiting it is optional and safe to repeat. It awaits
   /// [initializeStaticResources] first, and whatever on-demand shaders and
   /// tables the scene and [views] have started loading (see [preload]). On backends that compile pipelines
-  /// lazily on first draw (the common case) this front-loads that cost; on a
-  /// backend that compiles asynchronously it kicks compilation off without
-  /// blocking on completion.
+  /// lazily on first draw (the common case) this front-loads that cost. On a
+  /// backend that compiles in parallel (WebGL2 with
+  /// `KHR_parallel_shader_compile`), it starts every compile before drawing
+  /// with any, then waits for them without blocking, so the warm-up takes
+  /// about as long as the slowest one rather than their sum.
   ///
   /// Set [includeOffscreen] to encode every render item once. This costs more
   /// during loading, but avoids later pipeline stalls as a moving camera first
@@ -2066,12 +2180,19 @@ base class Scene implements SceneGraph {
   /// [allShadingTiers] to compile both now, so turning one of those features
   /// on or off later does not stall a frame on its first draw. It roughly
   /// doubles the lit pipelines warm-up compiles.
+  ///
+  /// [extraNodes] draw in the warm-up frames as if the scene held them, so
+  /// content added later (a spawned prefab, an editor's new primitive)
+  /// compiles now. Each frame attaches them in front of the first view's
+  /// camera and detaches them before it ends, so they never show in a visible
+  /// frame. Pass nodes no scene holds.
   /// {@category Assets and loading}
   Future<void> warmUp(
     List<RenderView> views, {
     bool includeOffscreen = false,
     Duration? sliceBudget,
     bool allShadingTiers = false,
+    List<Node> extraNodes = const [],
   }) async {
     _checkNotDisposed('warmUp');
     await initializeStaticResources();
@@ -2099,6 +2220,13 @@ base class Scene implements SceneGraph {
       // paced frame encodes nothing, so pacing is off while they encode.
       final framesInFlight = maxGpuFramesInFlight;
       if (allShadingTiers) maxGpuFramesInFlight = 0;
+      final holder = extraNodes.isEmpty
+          ? null
+          : (Node(
+              name: 'warm-up',
+              localTransform: _warmUpPlacement(views.first.camera),
+            )..addAll(extraNodes));
+      if (holder != null) add(holder);
       try {
         // With allShadingTiers, the frame encodes once under each lit tier
         // (one of them is the frame's own), so a later feature toggle that
@@ -2117,6 +2245,10 @@ base class Scene implements SceneGraph {
           );
         }
       } finally {
+        if (holder != null) {
+          remove(holder);
+          extraNodes.forEach(holder.remove);
+        }
         shadingTierOverride = null;
         maxGpuFramesInFlight = framesInFlight;
         _warmUpIncludeOffscreen = false;
@@ -2124,8 +2256,18 @@ base class Scene implements SceneGraph {
       }
     }
 
+    // Draws whose pipeline is still compiling are skipped, so one frame
+    // starts every compile it needs before any draw waits on one; the next
+    // frame, after they finish, draws with them.
     if (sliceBudget == null) {
-      encode();
+      for (var frame = 0; frame < 100; frame++) {
+        if (frame > 0) await awaitRasterThread();
+        if (_disposed) return;
+        final paced = _pacedFrameCount;
+        final held = withUnreadyPipelinesHeld(encode);
+        if (held.isEmpty && _pacedFrameCount == paced) return;
+        await awaitPipelinesReady(held);
+      }
       return;
     }
     // Each slice is a whole offscreen frame; stop once one encodes every view
@@ -2137,13 +2279,27 @@ base class Scene implements SceneGraph {
       if (slice > 0) await awaitRasterThread();
       if (_disposed) return;
       final paced = _pacedFrameCount;
-      withPipelineBuildBudget(sliceBudget, encode);
+      final held = withUnreadyPipelinesHeld(
+        () => withPipelineBuildBudget(sliceBudget, encode),
+      );
       if (_pacedFrameCount == paced && deferredPipelineBuilds == 0) return;
+      if (held.isNotEmpty) await awaitPipelinesReady(held);
       await Future<void>.delayed(const Duration(milliseconds: 16));
     }
   }
 
   bool _warmUpIncludeOffscreen = false;
+
+  // Just past the camera's near plane on its view axis, so every pass that
+  // culls to the view draws warm-up's extra nodes.
+  static Matrix4 _warmUpPlacement(Camera camera) {
+    final near = switch (camera.projection) {
+      PerspectiveProjection(:final near) => near,
+      OrthographicProjection(:final near) => near,
+      _ => 0.0,
+    };
+    return Matrix4.translation(camera.position + camera.forward * (near + 2.0));
+  }
 
   /// Renders a list of [views] of this scene onto [canvas].
   ///
@@ -2352,10 +2508,24 @@ base class Scene implements SceneGraph {
     // All other directional lights remain in the additional-light buffer.
     final lightComponent = renderScene.primaryDirectionalLight;
 
-    // Select this frame's shadow-casting spots and point lights
-    // (view-independent).
-    final spotShadowFrame = collectSpotShadows(visibleSpots);
-    final pointShadowFrame = collectPointShadows(visiblePoints);
+    // Select this frame's shadow-casting spots and point lights. Every view
+    // shares the selection, so it favors lights any of them can see.
+    // Built only when a light asks, so scenes without local shadows skip it.
+    final shadowViews =
+        visibleSpots.any((spot) => spot.light.castsShadow) ||
+            visiblePoints.any((point) => point.light.castsShadow)
+        ? _shadowViewVolumes(views, drawArea)
+        : null;
+    final spotShadowFrame = collectSpotShadows(
+      visibleSpots,
+      views: shadowViews,
+      previous: _grantedShadowCasters,
+    );
+    final pointShadowFrame = collectPointShadows(
+      visiblePoints,
+      views: shadowViews,
+      previous: _grantedShadowCasters,
+    );
     // Every tile in the shared atlas is one size, so resolve it once here
     // rather than per view: the point rows stamp their face resolution from
     // it, and ShadowPass renders the faces at the same size. The directional
@@ -2400,8 +2570,6 @@ base class Scene implements SceneGraph {
         : null;
 
     _recordShadowCasterBudget(
-      spots: visibleSpots,
-      points: visiblePoints,
       spotShadows: spotShadowFrame,
       pointShadows: pointShadowFrame,
     );
@@ -2996,6 +3164,9 @@ base class Scene implements SceneGraph {
             state,
           )
         : null;
+    final floatDepth =
+        DepthRaster.depthStencilFormatFor(reversed: reversedDepth) ==
+        gpu.PixelFormat.d32FloatS8UInt;
     if (fittable) {
       assert(() {
         if (!fitNearPlane) {
@@ -3010,16 +3181,20 @@ base class Scene implements SceneGraph {
           state.fitted = previous;
         }
         final fit = state.last;
-        if (fit != null) _reportNearPlane(fit, fitEnabled: fitNearPlane);
+        if (fit != null) {
+          _reportNearPlane(
+            fit,
+            fitEnabled: fitNearPlane,
+            reversedFloatDepth: reversedDepth && floatDepth,
+          );
+        }
         return true;
       }());
     }
     final raster = DepthRaster(
       reversed: reversedDepth,
       near: near,
-      floatDepth:
-          DepthRaster.depthStencilFormatFor(reversed: reversedDepth) ==
-          gpu.PixelFormat.d32FloatS8UInt,
+      floatDepth: floatDepth,
       tieBreak: coplanarTieBreak,
     );
     assert(() {
@@ -3176,7 +3351,11 @@ base class Scene implements SceneGraph {
   final Set<String> _warnedNearPlane = {};
 
   // Debug-only. Prints the near-plane advisory for [fit] once.
-  void _reportNearPlane(NearPlaneFit fit, {required bool fitEnabled}) {
+  void _reportNearPlane(
+    NearPlaneFit fit, {
+    required bool fitEnabled,
+    required bool reversedFloatDepth,
+  }) {
     final node = fit.nearestNode;
     final nodeName = node is Node ? node.name : null;
     final latch = fitEnabled ? 'pinned:${nodeName ?? ''}' : 'unfitted';
@@ -3185,6 +3364,7 @@ base class Scene implements SceneGraph {
       fit,
       fitEnabled: fitEnabled,
       nodeName: nodeName,
+      reversedFloatDepth: reversedFloatDepth,
     );
     if (message == null) return;
     _warnedNearPlane.add(latch);
@@ -3249,6 +3429,10 @@ base class Scene implements SceneGraph {
       viewportSize ?? pixelSize,
       raster: _depthRasterFor(view, viewportSize ?? pixelSize, viewIndex),
     );
+    setCurrentViewSizing(
+      view.camera.getViewTransform(viewportSize ?? pixelSize),
+      viewportSize ?? pixelSize,
+    );
     // A linear capture skips every resampling pass, but multisampling
     // resolves inside the scene pass, so a view that asks for it keeps it.
     final effectiveAa = captureLinearColor
@@ -3270,8 +3454,8 @@ base class Scene implements SceneGraph {
     // a translucent fish must be in it) and depth of field.
     final patchTranslucentDepth =
         wantDof ||
-        _renderPasses.any(
-          (pass) => pass.enabled && pass.inputs.contains(RenderInput.depth),
+        _passesWithInputs.any(
+          (pass) => pass.inputs.contains(RenderInput.depth),
         );
     final enableMsaa = effectiveAa == AntiAliasingMode.msaa;
     final enableFxaa = effectiveAa == AntiAliasingMode.fxaa && !debugActive;
@@ -3320,8 +3504,8 @@ base class Scene implements SceneGraph {
     // the engine produces depth/normals even without AO/SSR and publishes the
     // shadow uniform for depth-aware passes.
     final customInputs = <RenderInput>{};
-    for (final pass in _renderPasses) {
-      if (pass.enabled) customInputs.addAll(pass.inputs);
+    for (final pass in _passesWithInputs) {
+      customInputs.addAll(pass.inputs);
     }
     if (wantGodRays) customInputs.addAll(_godRaysPass.inputs);
 
@@ -3449,8 +3633,8 @@ base class Scene implements SceneGraph {
         !(capturePlanarReflections &&
             !captureLinearColor &&
             renderScene.planarReflectorComponents.isNotEmpty) &&
-        !_renderPasses.any(
-          (pass) => pass.enabled && pass.inputs.contains(RenderInput.shadowMap),
+        !_passesWithInputs.any(
+          (pass) => pass.inputs.contains(RenderInput.shadowMap),
         );
     if (receiverCullingAllowed) {
       // Receivers past the last cascade never sample the atlas, so an
@@ -3475,6 +3659,28 @@ base class Scene implements SceneGraph {
     }
 
     final graph = RenderGraph();
+    final postTime =
+        DateTime.now().millisecondsSinceEpoch.remainder(100000) / 1000.0;
+
+    // Custom passes whose output this frame's own draws read, before any of
+    // them (shadows, depth prepass, scene). They have no color chain, so they
+    // get no destination.
+    var beforeSceneIndex = 0;
+    for (final pass in _passesAt(RenderStage.beforeScene)) {
+      graph.addPass(
+        UserRenderGraphPass(
+          pass: pass,
+          camera: camera,
+          dimensions: pixelSize,
+          destination: null,
+          renderScene: renderScene,
+          viewLayerMask: view.layerMask,
+          passIndex: beforeSceneIndex++,
+          time: postTime,
+        ),
+      );
+    }
+
     // Directional cascades, shadow-casting spots, and shadow-casting point
     // lights share one atlas (and so one sampler in the lit shader). All tiles
     // use one resolution, the directional light's when it casts, otherwise the
@@ -3887,8 +4093,6 @@ base class Scene implements SceneGraph {
 
     final width = pixelSize.width.toInt();
     final height = pixelSize.height.toInt();
-    final postTime =
-        DateTime.now().millisecondsSinceEpoch.remainder(100000) / 1000.0;
 
     // Volumetric god rays, in HDR right after the scene (and reflections), so
     // the in-scattered light tone-maps with the rest of the frame. Built on the
@@ -4498,6 +4702,11 @@ class _PlanarCaptureResources {
 class _RepaintRequest extends ChangeNotifier {
   void notify() => notifyListeners();
 }
+
+/// Fires [scene]'s [Scene.repaintRequested] signal in widget tests.
+@visibleForTesting
+void notifySceneRepaintForTesting(Scene scene) =>
+    scene._repaintRequested.notify();
 
 // One view's near-plane fit across frames: the plane it rasterized with (for
 // hysteresis) and its last fit (for the advisory).

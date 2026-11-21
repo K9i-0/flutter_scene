@@ -43,6 +43,7 @@ class SmokeScene {
     this.setup, {
     this.preload,
     this.warmupFrames = 0,
+    this.requiredFrames = 1,
     this.fullCoverage = false,
     this.colorPassCounters,
     this.maxDepthConflictPixels,
@@ -66,6 +67,11 @@ class SmokeScene {
   /// 60 Hz cadence, and the smoke lanes render well below that.
   final int warmupFrames;
 
+  /// Frames every lane renders before the capture, for a scene that changes
+  /// after its first frame. Unlike [warmupFrames], this holds on the Android
+  /// lanes, which otherwise settle one frame.
+  final int requiredFrames;
+
   /// Whether drawn content reaches the corners, meaning they are geometry or
   /// glow (bloom over the transparent background) rather than the clear color.
   final bool fullCoverage;
@@ -73,6 +79,20 @@ class SmokeScene {
   /// When set, the scene is probed for depth conflicts (z-fighting) after the
   /// capture, and at most this many probe pixels may change hands.
   final int? maxDepthConflictPixels;
+}
+
+/// Runs [action] on the scene's second tick, once a frame has drawn what it
+/// replaces.
+class _AfterFirstFrame extends Component {
+  _AfterFirstFrame(this.action);
+
+  final void Function() action;
+  int _ticks = 0;
+
+  @override
+  void update(double deltaSeconds) {
+    if (++_ticks == 2) action();
+  }
 }
 
 /// The fixed three-quarter view shared by the scenes.
@@ -1988,7 +2008,8 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
   // the fragment color (blended from a per-vertex attribute forwarded through a
   // varying). Covers the whole custom-material path end to end: the build hook,
   // the generated fragment and vertex variants, sidecar params, a custom
-  // attribute, a custom varying, and the depth/shadow variant.
+  // attribute, a custom varying, and the depth/shadow variant. It also carries
+  // the engine's own line vertex shaders (segments and polylines).
   SmokeScene('fmat_custom_material', () {
     final material = _fmatMaterial('CustomMaterial')
       ..parameters.setFloat('amplitude', 0.3);
@@ -2035,6 +2056,47 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
           UnlitMaterial()..baseColorFactor = vm.Vector4(0.2, 0.9, 1.0, 1.0),
         ),
       )..localTransform = vm.Matrix4.translation(vm.Vector3(0, 0.5, 0)),
+    );
+    // Camera-facing polylines, expanded in their own vertex shader and placed
+    // by their nodes: a tapering gradient in screen pixels with round caps,
+    // and a dashed line in world units. Both cast shadows facing the light.
+    scene.add(
+      Node(
+          mesh: Mesh(
+            PolylineGeometry(
+              [
+                for (var i = 0; i <= 12; i++)
+                  vm.Vector3(-1.2 + i * 0.2, 0.15 * math.sin(i * 0.9), 0),
+              ],
+              perVertexWidth: [for (var i = 0; i <= 12; i++) 3.0 + i],
+              perVertexColor: [
+                for (var i = 0; i <= 12; i++) vm.Vector4(1.0, i / 12, 0.2, 1.0),
+              ],
+              cap: PolylineCap.round,
+            ),
+            UnlitMaterial(),
+          ),
+        )
+        ..localTransform =
+            vm.Matrix4.translation(vm.Vector3(0, 1.75, 0)) *
+            vm.Matrix4.rotationY(0.5),
+    );
+    scene.add(
+      Node(
+        mesh: Mesh(
+          PolylineGeometry(
+            [vm.Vector3(-1.4, 1.45, 0.6), vm.Vector3(1.4, 1.45, 0.6)],
+            width: 0.06,
+            widthMode: PolylineWidthMode.worldUnits,
+            dash: const DashPattern(
+              dashLength: 0.3,
+              gapLength: 0.15,
+              cap: PolylineCap.round,
+            ),
+          ),
+          UnlitMaterial()..baseColorFactor = vm.Vector4(1.0, 0.9, 0.2, 1.0),
+        ),
+      ),
     );
     // Mesh and material need not agree on custom attributes. A patch with no
     // `phase` stream drawn with the material reads it as zero, and the hero
@@ -2547,6 +2609,47 @@ final List<SmokeScene> kSmokeScenes = <SmokeScene>[
       ),
     );
   }, preload: loadWeightSumModel),
+  SmokeScene('primitive_assignment', () {
+    // Each node draws its first frame as a red or tall blue box, then assigns
+    // one field of its primitive. The harness counts the pixels only the
+    // original material and geometry can produce.
+    Node box(double x, double height, vm.Vector4 color) {
+      final material = PhysicallyBasedMaterial()
+        ..baseColorFactor = color
+        ..metallicFactor = 0
+        ..roughnessFactor = 0.6
+        ..vertexColorWeight = 0;
+      return Node(
+        mesh: Mesh(CuboidGeometry(vm.Vector3(1, height, 1)), material),
+      )..localTransform = vm.Matrix4.translationValues(x, height / 2 - 0.5, 0);
+    }
+
+    final recolored = box(-0.8, 1, vm.Vector4(0.9, 0.04, 0.04, 1));
+    final reshaped = box(0.8, 3, vm.Vector4(0.04, 0.1, 0.9, 1));
+    final green = PhysicallyBasedMaterial()
+      ..baseColorFactor = vm.Vector4(0.04, 0.8, 0.08, 1)
+      ..metallicFactor = 0
+      ..roughnessFactor = 0.6
+      ..vertexColorWeight = 0;
+    final short = CuboidGeometry(vm.Vector3(1, 1, 1));
+    final scene = Scene()
+      ..add(recolored)
+      ..add(reshaped);
+    scene.root.addComponent(
+      _AfterFirstFrame(() {
+        recolored.mesh!.primitives.single.material = green;
+        reshaped.mesh!.primitives.single.geometry = short;
+        reshaped.localTransform = vm.Matrix4.translationValues(0.8, 0, 0);
+      }),
+    );
+    return (
+      scene: scene,
+      camera: PerspectiveCamera(
+        position: vm.Vector3(0, 1.2, 6),
+        target: vm.Vector3(0, 0.6, 0),
+      ),
+    );
+  }, requiredFrames: 2),
   // Nine unit cubes ahead of the camera and twenty-seven behind it. The
   // frame shows the nine; the counters have to say the other twenty-seven
   // were culled, which is what a rejected BVH subtree never reported.

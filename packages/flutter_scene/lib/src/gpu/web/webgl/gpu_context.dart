@@ -29,6 +29,15 @@ final class WebGlContext extends GpuContext {
       );
     }
     _gl = gl;
+    // Before any link: the browser sizes the driver's compile thread pool
+    // when the page enables this, and with it a program's status can be
+    // polled instead of waited on (WebGlRenderPipeline.isLinkComplete).
+    _parallelShaderCompile =
+        _gl.getExtension('KHR_parallel_shader_compile') != null;
+    // Uploads are tightly packed, as flutter_gpu takes them. GL's default
+    // row alignment of 4 would skew any r8 or rg8 texture whose rows are not
+    // a multiple of four bytes.
+    _gl.pixelStorei(web.WebGL2RenderingContext.UNPACK_ALIGNMENT, 1);
     // Cache extensions we rely on for later phases.
     _gl.getExtension('EXT_color_buffer_float');
     _gl.getExtension('OES_texture_float_linear');
@@ -52,6 +61,8 @@ final class WebGlContext extends GpuContext {
   }
 
   bool _clipDepthZeroToOne = false;
+
+  bool _parallelShaderCompile = false;
 
   /// Whether clip-space depth spans `[0, 1]` (EXT_clip_control), so GLES
   /// shaders run without their `[-1, 1]` depth remap.
@@ -104,6 +115,11 @@ final class WebGlContext extends GpuContext {
   // mipmap min filters sample correctly.
   @override
   bool get doesSupportManuallyMippedTextures => true;
+
+  // TEXTURE_2D_ARRAY is core WebGL2, and the GLSL ES 3.00 bundles declare
+  // sampler2DArray as written.
+  @override
+  bool get doesSupportTextureArrays => true;
 
   final Map<TextureCompressionFamily, bool> _compressionSupport = {};
 
@@ -178,9 +194,13 @@ final class WebGlContext extends GpuContext {
   /// The GL store is hinted STATIC_DRAW, which suits geometry written once at
   /// creation. A geometry uploaded repeatedly (CPU morph blending re-uploads
   /// on every weight change) allocates fresh buffers per upload rather than
-  /// rewriting these, so each one is still written once.
+  /// rewriting these. The renderer's instance-data pool does rewrite them,
+  /// once per frame.
   // TODO(web-buffers): Reuse a geometry's buffers when it re-uploads at the
   // same size, instead of allocating a new pair and dropping the old one.
+  // TODO(web-buffers): Hint the instance pool's buffers DYNAMIC_DRAW. Needs a
+  // usage flag through createGeometryBuffers; measure on ANGLE's D3D11
+  // backend, where the hint affects how buffers are stored.
   DeviceBuffer createTypedDeviceBuffer(int sizeInBytes, {required bool index}) {
     return WebGlDeviceBuffer._initializeTyped(
       this,
@@ -221,6 +241,7 @@ final class WebGlContext extends GpuContext {
     bool enableShaderReadUsage = true,
     bool enableShaderWriteUsage = false,
     int mipLevelCount = 1,
+    int layerCount = 1,
   }) {
     final resolvedType =
         textureType ??
@@ -239,6 +260,7 @@ final class WebGlContext extends GpuContext {
       enableShaderReadUsage,
       enableShaderWriteUsage,
       mipLevelCount,
+      layerCount: layerCount,
     );
   }
 
@@ -283,10 +305,12 @@ final class WebGlContext extends GpuContext {
     return _pipelineCache[key] = WebGlRenderPipeline._(this, vertex, fragment);
   }
 
-  // Framebuffer cache, keyed by the attachment textures. A pass previously
-  // created (and leaked) a framebuffer and ran the synchronous
-  // checkFramebufferStatus round trip every time; render targets recur every
-  // frame, so both now happen once per attachment combination.
+  // Framebuffer cache, keyed by the attachment textures, so the synchronous
+  // checkFramebufferStatus round trip runs once per attachment combination
+  // rather than every pass. Releasing a texture drops its entries; the
+  // capacity only bounds targets dropped without a release, and evicts the
+  // least recently used so a frame's working set stays resident.
+  static const _framebufferCacheCapacity = 256;
   final Map<(Texture, int, int, Texture?), web.WebGLFramebuffer>
   _framebufferCache = {};
 
@@ -302,13 +326,13 @@ final class WebGlContext extends GpuContext {
       'A released Texture was used as a render target.',
     );
     final key = (color, mipLevel, slice, depth);
-    final cached = _framebufferCache[key];
-    if (cached != null) return cached;
-    if (_framebufferCache.length >= 64) {
-      for (final fbo in _framebufferCache.values) {
-        _gl.deleteFramebuffer(fbo);
-      }
-      _framebufferCache.clear();
+    // Reinserting moves the entry to the end of the map's iteration order,
+    // which keeps the first entry the least recently used.
+    final cached = _framebufferCache.remove(key);
+    if (cached != null) return _framebufferCache[key] = cached;
+    if (_framebufferCache.length >= _framebufferCacheCapacity) {
+      final oldest = _framebufferCache.keys.first;
+      _gl.deleteFramebuffer(_framebufferCache.remove(oldest));
     }
     return _framebufferCache[key] = create();
   }

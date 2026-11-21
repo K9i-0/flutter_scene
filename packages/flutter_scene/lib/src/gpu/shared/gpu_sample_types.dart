@@ -170,7 +170,129 @@ GpuSampleSlot resolveSampleSlot({
   );
 }
 
-/// The per-draw part of a pipeline's bind group layouts, packed into one int.
+/// Resolves the compact 3-bit signature code ([sampleSlotCode]) for [shape]
+/// and a bound texture's format/sampler flags without allocating a
+/// [GpuSampleSlot] record.
+int resolveSampleSlotCode({
+  required WgslTextureShape shape,
+  required bool formatDepth,
+  required bool formatFloat32,
+  required bool samplerFilters,
+  required bool float32Filterable,
+}) {
+  if (shape.depth) return 3;
+  switch (shape.scalar) {
+    case WgslTextureScalar.i32:
+      return 4;
+    case WgslTextureScalar.u32:
+      return 5;
+    case WgslTextureScalar.f32:
+      break;
+  }
+  final filterable =
+      !formatDepth &&
+      (!formatFloat32 || float32Filterable) &&
+      !shape.multisampled;
+  if (filterable) {
+    return samplerFilters ? 0 : 1;
+  }
+  return 2;
+}
+
+/// The 3-bit code [GpuSampleSignature] packs for [slot] (`0..5`).
+int sampleSlotCode(GpuSampleSlot slot) => switch (slot.sampleType) {
+  GpuTextureSampleType.float =>
+    slot.samplerType == GpuSamplerBindingType.filtering ? 0 : 1,
+  GpuTextureSampleType.unfilterableFloat => 2,
+  GpuTextureSampleType.depth => 3,
+  GpuTextureSampleType.sint => 4,
+  GpuTextureSampleType.uint => 5,
+};
+
+/// Reconstructs the layout-relevant [GpuSampleSlot] from a [sampleSlotCode].
+GpuSampleSlot sampleSlotFromCode(int code) => switch (code) {
+  0 => (
+    sampleType: GpuTextureSampleType.float,
+    samplerType: GpuSamplerBindingType.filtering,
+    samplerDowngraded: false,
+  ),
+  1 => (
+    sampleType: GpuTextureSampleType.float,
+    samplerType: GpuSamplerBindingType.nonFiltering,
+    samplerDowngraded: false,
+  ),
+  2 => (
+    sampleType: GpuTextureSampleType.unfilterableFloat,
+    samplerType: GpuSamplerBindingType.nonFiltering,
+    samplerDowngraded: false,
+  ),
+  3 => (
+    sampleType: GpuTextureSampleType.depth,
+    samplerType: GpuSamplerBindingType.comparison,
+    samplerDowngraded: false,
+  ),
+  4 => (
+    sampleType: GpuTextureSampleType.sint,
+    samplerType: GpuSamplerBindingType.nonFiltering,
+    samplerDowngraded: false,
+  ),
+  5 => (
+    sampleType: GpuTextureSampleType.uint,
+    samplerType: GpuSamplerBindingType.nonFiltering,
+    samplerDowngraded: false,
+  ),
+  _ => throw RangeError.range(code, 0, 5, 'code'),
+};
+
+/// Packs resolved slot codes ([sampleSlotCode]) three bits each into 30-bit
+/// lanes, ten codes to a lane. Reused across draws so packing allocates
+/// nothing once [overflow] has grown.
+final class GpuSampleLanes {
+  /// The first ten codes.
+  int primary = 0;
+
+  /// Lanes past the first. Only the first [overflowCount] are live.
+  final List<int> overflow = [];
+  int overflowCount = 0;
+
+  int _count = 0;
+
+  void reset() {
+    primary = 0;
+    overflowCount = 0;
+    _count = 0;
+  }
+
+  /// Appends the next slot's [code].
+  void add(int code) {
+    final lane = _count ~/ 10;
+    final shift = (_count % 10) * 3;
+    _count++;
+    if (lane == 0) {
+      primary |= code << shift;
+      return;
+    }
+    if (shift == 0) {
+      overflowCount = lane;
+      if (overflow.length < lane) {
+        overflow.add(0);
+      } else {
+        overflow[lane - 1] = 0;
+      }
+    }
+    overflow[lane - 1] |= code << shift;
+  }
+
+  /// An immutable copy, for use as a cache key.
+  GpuSampleSignature toSignature() => GpuSampleSignature._(
+    primary,
+    overflowCount == 0
+        ? const []
+        : List<int>.unmodifiable(overflow.take(overflowCount)),
+  );
+}
+
+/// The per-draw part of a pipeline's bind group layouts, packed into ints.
 ///
 /// A shader's declarations fix everything about its layouts except each
 /// texture slot's resolved [GpuSampleSlot], which depends on what is bound.
@@ -180,48 +302,45 @@ GpuSampleSlot resolveSampleSlot({
 /// into [overflow]. In practice nearly every draw of a material repeats
 /// the same signature, so the extra cache axis rarely misses.
 final class GpuSampleSignature {
-  GpuSampleSignature(Iterable<GpuSampleSlot> slotsInLayoutOrder) {
-    var lane = 0;
-    var shift = 0;
+  factory GpuSampleSignature(Iterable<GpuSampleSlot> slotsInLayoutOrder) {
+    final lanes = GpuSampleLanes();
     for (final slot in slotsInLayoutOrder) {
-      if (shift == 30) {
-        _lanes.add(lane);
-        lane = 0;
-        shift = 0;
-      }
-      lane |= _code(slot) << shift;
-      shift += 3;
+      lanes.add(sampleSlotCode(slot));
     }
-    _lanes.add(lane);
+    return lanes.toSignature();
   }
 
-  final List<int> _lanes = [];
-
-  static int _code(GpuSampleSlot slot) => switch (slot.sampleType) {
-    GpuTextureSampleType.float =>
-      slot.samplerType == GpuSamplerBindingType.filtering ? 0 : 1,
-    GpuTextureSampleType.unfilterableFloat => 2,
-    GpuTextureSampleType.depth => 3,
-    GpuTextureSampleType.sint => 4,
-    GpuTextureSampleType.uint => 5,
-  };
+  GpuSampleSignature._(this.primary, this.overflow)
+    : hashCode = overflow.isEmpty
+          ? primary.hashCode
+          : Object.hash(primary, Object.hashAll(overflow));
 
   /// The first 30 bits, enough for every built-in material.
-  int get primary => _lanes.first;
+  final int primary;
 
   /// Lanes past the first, empty for layouts of ten or fewer textures.
-  List<int> get overflow => _lanes.sublist(1);
+  final List<int> overflow;
+
+  /// The code packed for the slot at [index].
+  int codeAt(int index) {
+    final lane = index < 10 ? primary : overflow[index ~/ 10 - 1];
+    return (lane >> (index % 10) * 3) & 7;
+  }
+
+  @override
+  final int hashCode;
 
   @override
   bool operator ==(Object other) {
-    if (other is! GpuSampleSignature) return false;
-    if (other._lanes.length != _lanes.length) return false;
-    for (var i = 0; i < _lanes.length; i++) {
-      if (other._lanes[i] != _lanes[i]) return false;
+    if (identical(this, other)) return true;
+    if (other is! GpuSampleSignature ||
+        other.primary != primary ||
+        other.overflow.length != overflow.length) {
+      return false;
+    }
+    for (var i = 0; i < overflow.length; i++) {
+      if (other.overflow[i] != overflow[i]) return false;
     }
     return true;
   }
-
-  @override
-  int get hashCode => Object.hashAll(_lanes);
 }

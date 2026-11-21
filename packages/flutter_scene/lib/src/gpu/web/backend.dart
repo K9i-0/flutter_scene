@@ -57,6 +57,12 @@ abstract base class WebBackend {
   });
 
   Surface createSurface({required int width, required int height});
+
+  /// See the top-level [isPipelineReady]. True by default, for a backend that
+  /// cannot tell.
+  // TODO(webgpu-async-pipelines): report createRenderPipelineAsync's
+  // completion once the WebGPU backend builds pipelines with it.
+  bool isPipelineReady(RenderPipeline pipeline) => true;
 }
 
 final WebBackend _backend = useWebGpuBackend
@@ -73,6 +79,33 @@ GpuContext get gpuContext => _backend.context;
 /// The active backend's host integration.
 GpuHost get gpuHost => _backend.host;
 
+/// Whether the active context creates 2D-array textures.
+bool get supportsTextureArrays => gpuContext.doesSupportTextureArrays;
+
+/// A [width] x [height] 2D-array texture of [layerCount] layers.
+Texture createTexture2DArray(
+  StorageMode storageMode,
+  int width,
+  int height,
+  int layerCount, {
+  PixelFormat format = PixelFormat.r8g8b8a8UNormInt,
+}) => gpuContext.createTexture(
+  storageMode,
+  width,
+  height,
+  format: format,
+  textureType: TextureType.texture2DArray,
+  enableRenderTargetUsage: false,
+  layerCount: layerCount,
+);
+
+/// Whether [texture] is a 2D-array texture.
+bool isTexture2DArray(Texture texture) =>
+    texture.textureType == TextureType.texture2DArray;
+
+/// The layers of a 2D-array [texture], or 1 for every other kind.
+int textureLayerCount(Texture texture) => texture.layerCount;
+
 abstract base class GpuContext {
   PixelFormat get defaultColorFormat;
   PixelFormat get defaultStencilFormat;
@@ -81,6 +114,7 @@ abstract base class GpuContext {
   bool get doesSupportOffscreenMSAA;
   bool get doesSupportFramebufferRenderMipmap;
   bool get doesSupportManuallyMippedTextures;
+  bool get doesSupportTextureArrays;
   DeviceBuffer createDeviceBuffer(StorageMode storageMode, int sizeInBytes);
   DeviceBuffer createDeviceBufferWithCopy(ByteData data);
   HostBuffer createHostBuffer({
@@ -97,6 +131,7 @@ abstract base class GpuContext {
     bool enableShaderReadUsage = true,
     bool enableShaderWriteUsage = false,
     int mipLevelCount = 1,
+    int layerCount = 1,
   });
   bool supportsTextureCompression(TextureCompressionFamily family);
   CommandBuffer createCommandBuffer();
@@ -147,7 +182,13 @@ abstract base class Texture {
   bool get enableShaderReadUsage;
   bool get enableShaderWriteUsage;
   int get mipLevelCount;
+
+  /// The layers of a [TextureType.texture2DArray]; 1 for every other type.
+  int get layerCount;
   bool get isValid;
+
+  /// The slices [overwrite] addresses: 6 cube faces or the layers of an
+  /// array.
   int get sliceCount;
   int get bytesPerTexel;
   int getMipLevelSizeInBytes(int mipLevel);
@@ -330,3 +371,9 @@ bool writeGeometryData(
   source,
   destinationOffsetInBytes: destinationOffsetInBytes,
 );
+
+/// Whether [pipeline] is built, so its first draw will not wait on a shader
+/// compile. On WebGL2 with `KHR_parallel_shader_compile` this polls the
+/// program's link; elsewhere it is always true.
+bool isPipelineReady(RenderPipeline pipeline) =>
+    _backend.isPipelineReady(pipeline);

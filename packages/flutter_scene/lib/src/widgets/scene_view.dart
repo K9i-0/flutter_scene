@@ -9,6 +9,9 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_scene/src/camera.dart';
 import 'package:flutter_scene/src/hot_reload/hot_reload_coordinator.dart';
 import 'package:flutter_scene/src/material/environment.dart';
+import 'package:flutter_scene/src/material/physical_material_variant.dart'
+    show retryFailedPhysicalMaterialResources;
+import 'package:flutter_scene/src/node.dart';
 import 'package:flutter_scene/src/tone_mapping.dart';
 import 'package:flutter_scene/src/widgets/declarative.dart';
 import 'package:flutter_scene/src/render_view.dart';
@@ -54,6 +57,13 @@ typedef SceneTickCallback =
 /// {@category Widgets}
 typedef SceneLoadingBuilder =
     Widget Function(BuildContext context, double progress);
+
+/// Builds the widget shown when a [SceneView] cannot load the engine resources
+/// it needs to draw, given the [error]. Calling [retry] loads them again. See
+/// [SceneView.errorBuilder].
+/// {@category Widgets}
+typedef SceneErrorBuilder =
+    Widget Function(BuildContext context, Object error, VoidCallback retry);
 
 /// A widget that renders a [Scene] and drives its per-frame repaint.
 ///
@@ -112,9 +122,11 @@ class SceneView extends StatefulWidget {
     this.maxFrameRate,
     this.loading,
     this.loadingBuilder,
+    this.errorBuilder,
     this.revealMinDuration = Duration.zero,
     this.warmUp = false,
     this.warmUpAllShadingTiers = false,
+    this.warmUpExtraNodes = const [],
     this.debugWidgetInput = false,
     this.children = const [],
   }) : environment = null,
@@ -160,9 +172,11 @@ class SceneView extends StatefulWidget {
     this.maxFrameRate,
     this.loading,
     this.loadingBuilder,
+    this.errorBuilder,
     this.revealMinDuration = Duration.zero,
     this.warmUp = false,
     this.warmUpAllShadingTiers = false,
+    this.warmUpExtraNodes = const [],
     this.debugWidgetInput = false,
     this.children = const [],
   }) : scene = null,
@@ -219,11 +233,20 @@ class SceneView extends StatefulWidget {
   /// Leave `true` (the default) for animated content. Set `false` for a static
   /// scene that only needs to repaint when the app rebuilds the view (for
   /// example with a new [camera]).
+  ///
+  /// It can change over the view's life, to pause a view that is hidden, say.
+  /// Turning it back on continues the view's elapsed time from where it
+  /// stopped, and the first [onTick] after that reports a zero delta.
+  ///
+  /// The scene's own step is separate. [Scene.render] advances components and
+  /// animations by the wall time since it last ran, the time spent off
+  /// included, unless the app calls [Scene.update] itself.
   final bool autoTick;
 
-  /// Retry a GPU-paced frame when its outstanding work completes. Disable
-  /// when an external repaint driver owns the cadence, so completion cannot
-  /// bypass its frame cap. The driver must continue requesting frames.
+  /// Repaint when a GPU-paced frame's outstanding work, or a deferred load,
+  /// completes. Disable when an external repaint driver owns the cadence, so
+  /// a completion cannot bypass its frame cap. The driver must continue
+  /// requesting frames.
   final bool repaintOnGpuCompletion;
 
   /// Logical-to-physical pixel multiplier for the offscreen render target,
@@ -275,6 +298,17 @@ class SceneView extends StatefulWidget {
   /// the space is left blank until the scene is revealed.
   final SceneLoadingBuilder? loadingBuilder;
 
+  /// Builds the widget shown in place of the loading widget when the engine's
+  /// shared static resources fail to load ([Scene.initializeStaticResources]),
+  /// for example when a web build cannot fetch its shader bundle.
+  ///
+  /// Its `retry` callback loads them again and, on success, reveals the scene
+  /// as usual. The view never retries on its own; the app decides when.
+  /// Providing it gates the view like [loadingBuilder], and the error it
+  /// receives is not reported to [FlutterError.onError]. When null, the error
+  /// is reported and the view stays on its loading widget.
+  final SceneErrorBuilder? errorBuilder;
+
   /// The minimum time the loading widget stays up once shown, so a fast load
   /// does not flash it for a single frame. Defaults to [Duration.zero].
   final Duration revealMinDuration;
@@ -293,6 +327,11 @@ class SceneView extends StatefulWidget {
   /// occlusion or another tier-switching feature on or off later does not
   /// stall a frame. Lengthens warm-up.
   final bool warmUpAllShadingTiers;
+
+  /// With [warmUp], nodes the scene does not hold yet whose pipelines to
+  /// compile too (see [Scene.warmUp]'s `extraNodes`), such as content the app
+  /// adds after the reveal.
+  final List<Node> warmUpExtraNodes;
 
   /// Resolves the camera for a single-view frame.
   ///
@@ -358,20 +397,32 @@ class _SceneViewState extends State<SceneView>
   // (and its first frame delta) from zero rather than from app launch.
   Duration _tickOrigin = Duration.zero;
 
+  // Set when `autoTick` turns the ticker back on. A restarted ticker counts
+  // from zero, so the next tick moves the origin to continue the clock from
+  // where it stopped, with no step for the time spent off.
+  bool _resumed = false;
+
   // Whether the scene is being drawn yet. While gated (see `_gated`) it stays
   // false until static resources and the `loading` group are ready, and the
   // loading widget shows instead. Ungated views reveal immediately, so this is
   // true from the first frame and behavior matches a view with no loading args.
   bool _revealed = false;
+  // The static resource failure an `errorBuilder` is showing, cleared on retry.
+  Object? _loadError;
   // Bumps on each reveal watch so a stale async wait (after the loading group
   // is swapped) cannot reveal the wrong generation.
   int _revealGeneration = 0;
 
   // A view gates rendering only when it opts in with a `loading` group, a
-  // `loadingBuilder`, or `warmUp`; otherwise it renders as soon as it can,
-  // unchanged.
-  bool get _gated =>
-      widget.loading != null || widget.loadingBuilder != null || widget.warmUp;
+  // `loadingBuilder`, an `errorBuilder`, or `warmUp`; otherwise it renders as
+  // soon as it can, unchanged.
+  bool get _gated => _isGated(widget);
+
+  static bool _isGated(SceneView view) =>
+      view.loading != null ||
+      view.loadingBuilder != null ||
+      view.errorBuilder != null ||
+      view.warmUp;
 
   // Builds the semantics elements for the scene's SemanticsComponents and
   // widget surfaces; refreshed by the painter after each rendered frame.
@@ -407,11 +458,17 @@ class _SceneViewState extends State<SceneView>
 
   void _onAssetsRefreshed() => _repaint.notify();
 
-  // A paced frame's GPU work finished; paint the frame the view held.
+  // A paced frame's GPU work, or a deferred load, finished. A running ticker
+  // paints on its next vsync, with a tick, so only its rate limit is reset.
   void _onRepaintRequested() {
-    // An automatic ticker will retry on its next permitted frame. Retrying
-    // here would bypass maxFrameRate and encode without onTick advancing.
-    if (widget.repaintOnGpuCompletion && !widget.autoTick) _repaint.notify();
+    // Fork: an external repaint driver owns the cadence and keeps requesting
+    // frames, so a completion must neither repaint nor lift its frame cap.
+    if (!widget.repaintOnGpuCompletion) return;
+    if (widget.autoTick && (_ticker?.isTicking ?? false) && _revealed) {
+      _frameDue = null;
+      return;
+    }
+    _repaint.notify();
   }
 
   // Creates the owned scene for the declarative form and applies every scene
@@ -456,8 +513,16 @@ class _SceneViewState extends State<SceneView>
     super.didUpdateWidget(oldWidget);
     if (widget.maxFrameRate != oldWidget.maxFrameRate) _frameDue = null;
     if (widget.autoTick != oldWidget.autoTick) {
-      _ticker?.dispose();
-      _ticker = widget.autoTick ? (createTicker(_onTick)..start()) : null;
+      // One ticker for the state's life, stopped and restarted: the
+      // single-ticker mixin rejects a second.
+      if (widget.autoTick) {
+        (_ticker ??= createTicker(_onTick)).start();
+        _resumed = true;
+        // The deadline was in the stopped ticker's time.
+        _frameDue = null;
+      } else {
+        _ticker?.stop();
+      }
     }
     final oldScene = oldWidget.scene ?? _ownedScene;
     if (widget.scene == null) {
@@ -490,12 +555,8 @@ class _SceneViewState extends State<SceneView>
     }
     // A new set of resources to wait for, a newly gated view, or a different
     // scene: hold the scene again until its loads and warm-up complete.
-    final gatedBefore =
-        oldWidget.loading != null ||
-        oldWidget.loadingBuilder != null ||
-        oldWidget.warmUp;
     if (widget.loading != oldWidget.loading ||
-        _gated != gatedBefore ||
+        _gated != _isGated(oldWidget) ||
         !identical(_scene, oldScene)) {
       _revealed = !_gated;
       if (_gated) {
@@ -512,14 +573,20 @@ class _SceneViewState extends State<SceneView>
   // is never drawn.
   Future<void> _startRevealWatch() async {
     final generation = ++_revealGeneration;
+    _loadError = null;
     final start = DateTime.now();
     try {
       await Scene.initializeStaticResources();
     } catch (error, stack) {
-      // The static resources now report their failure instead of completing
-      // normally. Nothing here can recover (without them no frame can be
-      // drawn), so the view stays on its loading widget, but the cause is
-      // reported rather than left as an unhandled error on this future.
+      // No frame can be drawn without the static resources. An errorBuilder
+      // takes the failure and offers a retry; otherwise the view stays on its
+      // loading widget and reports the cause.
+      if (widget.errorBuilder != null) {
+        if (mounted && generation == _revealGeneration) {
+          setState(() => _loadError = error);
+        }
+        return;
+      }
       FlutterError.reportError(
         FlutterErrorDetails(
           exception: error,
@@ -555,6 +622,7 @@ class _SceneViewState extends State<SceneView>
         _warmUpViews(),
         sliceBudget: const Duration(milliseconds: 50),
         allShadingTiers: widget.warmUpAllShadingTiers,
+        extraNodes: widget.warmUpExtraNodes,
       );
       if (!mounted || generation != _revealGeneration) return;
     }
@@ -565,6 +633,15 @@ class _SceneViewState extends State<SceneView>
     }
     if (!mounted || generation != _revealGeneration) return;
     setState(() => _revealed = true);
+  }
+
+  // The errorBuilder's retry. A failed physical bundle loads again too, so
+  // the retried reveal waits for it rather than keeping the fallback shader.
+  void _retry() {
+    if (!mounted || _loadError == null) return;
+    setState(() => _loadError = null);
+    retryFailedPhysicalMaterialResources();
+    _startRevealWatch();
   }
 
   // The views to warm up, matching what the first rendered frame will use.
@@ -579,7 +656,13 @@ class _SceneViewState extends State<SceneView>
       // is a single frame, not the whole time spent on the loading screen.
       _tickOrigin = elapsed;
       _lastTickTime = now;
+      _resumed = false;
       return;
+    }
+    if (_resumed) {
+      _resumed = false;
+      _tickOrigin = elapsed - _elapsed.value;
+      _lastTickTime = now;
     }
     final rate = widget.maxFrameRate;
     if (rate != null && rate > 0) {
@@ -760,6 +843,11 @@ class _SceneViewState extends State<SceneView>
 
   Widget _buildView(BuildContext context) {
     if (!_revealed) {
+      final error = _loadError;
+      final errorBuilder = widget.errorBuilder;
+      if (error != null && errorBuilder != null) {
+        return errorBuilder(context, error, _retry);
+      }
       return _buildLoading(context);
     }
     return Listener(

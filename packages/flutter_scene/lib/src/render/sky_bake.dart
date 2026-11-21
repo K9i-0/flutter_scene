@@ -355,8 +355,7 @@ class SkyBakeJob {
   int _step = -1;
   static const int _equirectStep = 6;
   static const int _firstBandStep = 7;
-  int get _shStep =>
-      _firstBandStep + kPrefilterBandCount * (_useCube ? 6 : 1);
+  int get _shStep => _firstBandStep + kPrefilterBandCount * (_useCube ? 6 : 1);
 
   /// Whether a cycle is in progress.
   bool get inFlight => _step >= 0;

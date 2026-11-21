@@ -403,6 +403,13 @@ class ScenePass extends RenderGraphPass {
       orthographic: projection.orthographic,
       time: _time,
       planarReflectionsSuppressed: _suppressPlanarReflections,
+      surfaceDebugViews: _debugView?.drawsSurfaceViews ?? false,
+    );
+    // TODO(lighting-features-passes): skip the occlusion pass and irradiance
+    // field updates for a compiled-out feature, whose output nothing reads.
+    debugWarnCompiledOutLightingFeatures(
+      lighting.usedLightingFeatures,
+      compiledOutLightingFeatures,
     );
 
     final commandBuffer = gpu.gpuContext.createCommandBuffer();
@@ -472,6 +479,7 @@ class ScenePass extends RenderGraphPass {
       }
       rendererSubmissions.submit(commandBuffer);
       _encodeDisplayReferredLayer(context, encoder, depth, width, height);
+      if (ssaoMap != null) context.texturePool.releaseScoped(ssaoMap);
       context.blackboard.set(kSceneColorBlackboardKey, hdrColor);
       return;
     }
@@ -594,6 +602,7 @@ class ScenePass extends RenderGraphPass {
     }
 
     _encodeDisplayReferredLayer(context, encoder, depth, width, height);
+    if (ssaoMap != null) context.texturePool.releaseScoped(ssaoMap);
     context.blackboard.set(kSceneColorBlackboardKey, currentColor);
     flushWatch?.stop();
     if (profileRendering) {

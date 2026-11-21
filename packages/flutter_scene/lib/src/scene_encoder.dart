@@ -414,8 +414,16 @@ gpu.RenderPipeline? cachedRenderPipeline(
   gpu.Shader vertexShader,
   gpu.Shader fragmentShader,
   VertexLayoutDescriptor? vertexLayout,
-) =>
-    _cachedPipeline(vertexShader, fragmentShader, vertexLayoutId(vertexLayout));
+) {
+  final pipeline = _cachedPipeline(
+    vertexShader,
+    fragmentShader,
+    vertexLayoutId(vertexLayout),
+  );
+  return _holdingUnready && pipeline != null
+      ? _holdIfUnready(pipeline)
+      : pipeline;
+}
 
 /// Pipeline keys the backend refused to build, so a rejected pairing is not
 /// retried every frame. Keyed exactly like [_pipelineCache] and evicted with
@@ -425,36 +433,99 @@ gpu.RenderPipeline? cachedRenderPipeline(
 final Set<(gpu.Shader, gpu.Shader, int)> _rejectedPipelines = {};
 
 // A sliced warm-up's build budget: while set, new pipelines stop building
-// once builds have taken this long, and the draws that need the rest are
-// skipped and counted, so the warm-up yields and tries them next slice.
+// once the slice has run this long, and the draws that need the rest are
+// skipped and counted, so the warm-up yields and tries them next slice. The
+// clock is wall time because a backend compiles a pipeline when a pass first
+// binds it, not when it is created.
 Duration? _buildBudget;
 final Stopwatch _buildClock = Stopwatch();
 int _deferredBuilds = 0;
+bool _builtThisSlice = false;
+// The last slice deferred before building anything (its other work used the
+// budget), so this one builds at least one pipeline.
+bool _starved = false;
 
-/// Runs [body] with new pipeline builds capped at [budget] of build time;
-/// draws past it are skipped and counted in [deferredPipelineBuilds].
+/// Runs [body] with new pipeline builds stopped once it has run for [budget];
+/// draws past it are skipped and counted in [deferredPipelineBuilds]. A slice
+/// after one that built nothing builds at least one.
 @internal
 T withPipelineBuildBudget<T>(Duration budget, T Function() body) {
   _buildBudget = budget;
   _buildClock
-    ..stop()
-    ..reset();
+    ..reset()
+    ..start();
   _deferredBuilds = 0;
+  _builtThisSlice = false;
   try {
     return body();
   } finally {
     _buildBudget = null;
+    _buildClock.stop();
+    _starved = _deferredBuilds > 0 && !_builtThisSlice;
   }
 }
 
-/// Draws the last [withPipelineBuildBudget] skipped for lack of budget.
+/// Draws the last [withPipelineBuildBudget] skipped for lack of budget, or
+/// because [withUnreadyPipelinesHeld] held their pipeline.
 @internal
 int get deferredPipelineBuilds => _deferredBuilds;
+
+// While set, a guarded draw whose pipeline is still compiling is skipped
+// rather than waiting on it, so a warm-up starts every compile before it
+// waits on any and the backend can run them in parallel.
+bool _holdingUnready = false;
+final Set<gpu.RenderPipeline> _heldPipelines = {};
+
+/// Runs [body] with draws skipped whose pipeline the backend is still
+/// compiling (see `gpu.isPipelineReady`), counting them in
+/// [deferredPipelineBuilds]. Returns the pipelines held, for
+/// [awaitPipelinesReady].
+///
+/// Only guarded draws ([cachedRenderPipeline], [tryResolvePipeline]) are
+/// held; a pass that binds [resolvePipeline] directly still waits.
+@internal
+Set<gpu.RenderPipeline> withUnreadyPipelinesHeld(void Function() body) {
+  _holdingUnready = true;
+  _heldPipelines.clear();
+  try {
+    body();
+  } finally {
+    _holdingUnready = false;
+  }
+  return Set.of(_heldPipelines);
+}
+
+gpu.RenderPipeline? _holdIfUnready(gpu.RenderPipeline pipeline) {
+  if (gpu.isPipelineReady(pipeline)) return pipeline;
+  _heldPipelines.add(pipeline);
+  _deferredBuilds++;
+  return null;
+}
+
+/// Completes once every pipeline in [pipelines] is ready, polling without
+/// blocking, or after [timeout] (the first draw then waits instead).
+@internal
+Future<void> awaitPipelinesReady(
+  Iterable<gpu.RenderPipeline> pipelines, {
+  Duration timeout = const Duration(seconds: 30),
+}) async {
+  final pending = pipelines.toList();
+  final clock = Stopwatch()..start();
+  while (pending.isNotEmpty && clock.elapsed < timeout) {
+    // The last issued usually finishes last, so most polls are one query.
+    while (pending.isNotEmpty && gpu.isPipelineReady(pending.last)) {
+      pending.removeLast();
+    }
+    if (pending.isEmpty) return;
+    await Future<void>.delayed(const Duration(milliseconds: 4));
+  }
+}
 
 bool _deferBuild((gpu.Shader, gpu.Shader, int) key) {
   final budget = _buildBudget;
   if (budget == null || _pipelineCache.containsKey(key)) return false;
   if (_buildClock.elapsed < budget) return false;
+  if (_starved && !_builtThisSlice) return false;
   _deferredBuilds++;
   return true;
 }
@@ -482,13 +553,12 @@ gpu.RenderPipeline resolvePipeline(
   final stopwatch = kDebugMode || profileRendering
       ? (Stopwatch()..start())
       : null;
-  if (_buildBudget != null) _buildClock.start();
+  if (_buildBudget != null) _builtThisSlice = true;
   final pipeline = gpu.gpuContext.createRenderPipeline(
     vertexShader,
     fragmentShader,
     vertexLayout: vertexLayout?.toGpuLayout(),
   );
-  _buildClock.stop();
   if (stopwatch != null) {
     stopwatch.stop();
     // A backend pipeline build is synchronous and lands mid-frame the first
@@ -572,9 +642,11 @@ gpu.RenderPipeline? tryResolvePipeline(
   String Function()? debugContext,
 }) {
   final layoutId = vertexLayoutId(vertexLayout);
-  // A built pipeline is never rejected or deferred.
+  // A built pipeline is never rejected or budget-deferred, only held.
   final cached = _cachedPipeline(vertexShader, fragmentShader, layoutId);
-  if (cached != null) return cached;
+  if (cached != null) {
+    return _holdingUnready ? _holdIfUnready(cached) : cached;
+  }
   final key = (vertexShader, fragmentShader, layoutId);
   if (_rejectedPipelines.contains(key)) return null;
   if (_deferBuild(key)) return null;
@@ -590,12 +662,13 @@ gpu.RenderPipeline? tryResolvePipeline(
     return null;
   }
   try {
-    return resolvePipeline(
+    final pipeline = resolvePipeline(
       vertexShader,
       fragmentShader,
       vertexLayout: vertexLayout,
       debugContext: debugContext,
     );
+    return _holdingUnready ? _holdIfUnready(pipeline) : pipeline;
   } on Exception catch (error) {
     _rejectedPipelines.add(key);
     debugPrint(

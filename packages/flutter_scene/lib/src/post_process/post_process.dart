@@ -122,11 +122,6 @@ class FilmGrainSettings {
 /// chain of HDR passes and added back to the scene before tone mapping.
 /// {@category Rendering}
 class BloomSettings {
-  /// Number of downsample levels, clamped to 3–6 when rendering. The
-  /// default 6 retains the widest glow. 4 reduces the pyramid from eleven
-  /// to seven passes for mobile, with a tighter glow at the same intensity.
-  int mipCount = 6;
-
   /// Whether bloom runs. Off by default.
   bool enabled = false;
 
@@ -154,6 +149,12 @@ class BloomSettings {
   /// spreads the same number of pixels in either and nothing changes as it
   /// crosses between them.
   double? referenceSize;
+
+  /// How many levels the chain downsamples through, clamped to 3 to 6. Each
+  /// level below 6 drops one downsample and one upsample pass, and the widest
+  /// part of the glow with them. Brightness stays the same, so 4 gives a
+  /// tighter glow in seven passes instead of eleven.
+  int levels = 6;
 
   /// The brightness a source pixel softly compresses toward before it blooms,
   /// so an extreme highlight cannot flood the frame. Values well below it pass

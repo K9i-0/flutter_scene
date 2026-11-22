@@ -30,8 +30,8 @@ void main() {
       unclipped,
       const ui.Size(1280, 800),
     );
-    // Vertex rays are divided by w and then interpolated over the fullscreen
-    // triangles. Oblique clipping must not distort that interpolation.
+    // Corner rays are interpolated over the fullscreen triangles. Oblique
+    // clipping must not distort that interpolation.
     Vector3 ray(Matrix4 inverse, double x, double y) {
       final h = inverse * Vector4(x, y, 1, 1);
       return Vector3(h.x, h.y, h.z) / h.w;

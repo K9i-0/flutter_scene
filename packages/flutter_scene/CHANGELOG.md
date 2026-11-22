@@ -1,13 +1,28 @@
 ## 0.24.4
 
-* Fork: `BloomSettings.mipCount` selects 3–6 levels. Four levels use seven passes instead of eleven, preserving constant-input brightness with a tighter glow.
-* Fork: `PhysicallyBasedMaterial.alphaMaskInShader` lets a masked material test its cutoff in its color shader (eight `StandardMasked*Fragment` variants), so the main pass draws it once instead of a coverage pre-draw plus an equal-depth color draw. It trades early depth testing on that material for one draw call per cutout; foliage-heavy scenes on Pixel 7 drew about 20 fewer draws a frame and spent about 2 ms less encoding.
+* Fork: `PhysicallyBasedMaterial.alphaMaskInShader` makes a masked material test its cutoff in its color shader (eight `StandardMasked*Fragment` variants), so the main pass draws it once.
 * Fork: `SceneView.repaintOnGpuCompletion: false` stops GPU-completion and deferred-load repaints (and the `maxFrameRate` reset they cause), so an external repaint driver retains control of its cadence.
+* Fork: a refreshing `SkyEnvironment` on the cube radiance layout prefilters one face per frame instead of six.
 
+* `BloomSettings.levels` sets how many levels the bloom chain blurs through (3 to 6). Fewer levels take fewer passes and give a tighter glow at the same brightness.
+* Crossfading clips no longer dips a node's rotation toward its bind pose.
+* Shadow passes cull the instances of an `InstancedMesh` with `cullInstances` against each light's volume, instead of drawing them all.
+* A component that sets its node's `visible` in `update` shows or hides the node and its descendants that frame, not the next.
+* The sky in a planar reflection (`PlanarReflectionCamera`, or any camera with an oblique near plane) is no longer stretched.
 * `RenderStage.beforeScene` runs a `CustomRenderPass` before the view draws anything, so the same frame's materials can sample what it produces.
 * `Texture2DArray` uploads layered data textures, sampled in `.fmat` materials through `sampler2DArray` parameters. Arrays work on the web backends, and on Metal and Vulkan with Flutter 3.50 or newer (`Texture2DArray.isSupported`).
 * `Texture2D.fromData` builds a texture from raw texels in a `DataTextureFormat` (`r8`, `rg8`, `rgba8`, `r32Float`, `rgba16Float`, `rgba32Float`).
 * `r8` and `rg8` textures whose rows are not a multiple of four bytes upload correctly on WebGL2.
+* `OffAxisProjection` is a lens with four separate frustum edges (`fromAngles`, `fromMatrix`), the shape a headset gives for each eye.
+* `RenderViewGroup` and `Scene.renderViewGroups` render views together, culling once and fitting and rendering the shadows once, so both eyes of a stereo pair shade identically.
+* `RenderView.cullingFrustum` overrides the frustum a view culls against.
+* `Scene.renderViewsToTargets` renders views into caller-owned textures (`ExternalRenderTarget`) from any frame loop and returns a `FrameCompletion`. On the web, `wrapExternalColorTarget` wraps a WebGL framebuffer or texture from `nativeGraphicsContext`.
+* `ExternalRenderTarget.allocate` creates a target the package owns. On the web, `textureToPlatformImage` hands a texture to another WebGL context as an `ImageBitmap`.
+* `ExternalRenderTarget.surfaceFrame` leases an image from a `GpuSurface`. The scene presents it after the frame's last GPU work, or discards it when the frame is skipped or throws.
+* An `ExternalRenderTarget` in an sRGB format receives linear color so its image is encoded once, and `ExternalRenderTarget.backgroundColor` puts a color behind the scene.
+* `WidgetHost` keeps a scene's `WidgetComponent`s live when it renders without a `SceneView`.
+* On the web, `Texture.asImage()` after a pass that set a scissor no longer drops the pixels outside it.
+* Two views with temporal anti-aliasing no longer share one history and reproject each other's frames.
 * A `PolylineGeometry` draws without the app calling `updateForCamera` each frame, which is deprecated and does nothing. Its strip is expanded in a vertex shader for whichever camera renders it, so every view of a scene sees it face on, and it follows its node's transform.
 * BREAKING: `PolylineGeometry` extends `Geometry`, not `MeshGeometry`, and a raycast no longer hits it.
 * `SceneView.errorBuilder` shows a failed engine resource load (such as a shader bundle a web build could not fetch) with a `retry` callback, instead of leaving the view on its loading widget.
@@ -43,6 +58,19 @@
 * The WebGPU web backend encodes draws without allocating or searching its bindings by name, reusing cached pipelines and bind groups across draws.
 * The WebGPU web backend waits on one queue fence for all the passes submitted in a turn instead of one per pass. Submitting a 12-pass frame went from 0.48 ms to 0.29 ms.
 * Ambient occlusion, screen-space reflections, depth of field, and SMAA reuse each other's intermediate textures within a frame, holding 28 to 48 MB less at 1080p.
+* The web backends keep two frames in flight, as Metal does. A 1080p PBR scene on WebGPU went from 11 to 55 fps.
+* WebGL2 asks for the high-performance GPU, as WebGPU does, so machines with two GPUs render on the faster one.
+* Sliced web texture loads yield with `scheduler.yield()` where the browser has it, so they no longer wait about 4 ms per yield.
+* WebGL reports GPU completion through fences, so a GPU-bound scene paces its frames instead of stalling the rest of the app.
+* WebGL skips render state calls that change nothing.
+* Transient buffers, light index textures, and `MeshGeometry` attribute updates (`updatePositions` and the rest) reuse their allocations rather than reallocating each frame.
+* A rate-limited `SceneView` whose ticker is running paints on its next vsync when a paced frame finishes, instead of repainting between ticks.
+* `Scene.warmUp` renders into a scratch surface at the view's aspect ratio, so warming up a live scene no longer evicts its render targets, disturbs TAA and SSGI history, or invalidates cached shadow cascades.
+* Shadow-casting spot and point lights each use their own `shadowMapResolution`, bias, and softness, instead of the first caster's or the directional light's.
+* The shadow atlas packs its tiles in two dimensions and stays within 8192 texels, so a 2048 `DirectionalLight` with a shadow-casting spot no longer fails on mobile and web.
+* God rays read the right cascades when spot or point lights also cast shadows.
+* BREAKING: `SpotShadowInfo` gives each spot's atlas tile in `rects`, replacing `firstTile`, `totalTiles`, and `tileResolution`. `RenderPassContext.shadowInfo` adds a `cascade_atlas` vec4 placing the cascades.
+* `Lighting.spotShadowDepthBias`, `spotShadowNormalBias`, and `spotShadowSoftness` are deprecated and unused.
 * `PhysicallyBasedMaterial` and `UnlitMaterial` repack their texture transforms only when one changes, including an edit in place such as `transform.offset.x += 0.1`.
 * On the web, a batch of KTX2 textures or mip chain builds yields to the browser between textures instead of freezing the page until the whole batch finishes. One large texture still blocks while it decodes.
 * The WebGL2 web backend compiles shaders in parallel and checks a program's link only when it is first drawn, and `Scene.warmUp` starts every pipeline's compile before drawing with any. A warm-up on Windows (ANGLE) takes about half as long and no longer freezes the page while it compiles.

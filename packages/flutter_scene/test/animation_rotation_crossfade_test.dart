@@ -30,7 +30,7 @@ void expectAngle(Node bone, double radians) {
 }
 
 void main() {
-  test('identical poses remain constant throughout a normalized crossfade', () {
+  test('identical poses hold through a crossfade', () {
     final rig = Node(name: 'rig'), bone = Node(name: 'bone');
     rig.add(bone);
     final a = rig.createAnimationClip(rotation('a', 'bone', math.pi / 2));
@@ -43,44 +43,37 @@ void main() {
     }
   });
 
-  test(
-    'two full-weight poses interpolate independently of registration order',
-    () {
-      for (final reverse in [false, true]) {
-        final rig = Node(name: 'rig'), bone = Node(name: 'bone');
-        rig.add(bone);
-        final angles = reverse ? [1.2, .4] : [.4, 1.2];
-        final a = rig.createAnimationClip(rotation('a', 'bone', angles[0]));
-        final b = rig.createAnimationClip(rotation('b', 'bone', angles[1]));
-        a.weight = reverse ? .3 : .7;
-        b.weight = 1 - a.weight;
-        rig.scenePrePass(0);
-        expectAngle(bone, .4 * .7 + 1.2 * .3);
-        // Overweight clips are normalized by the player.
-        a.weight = b.weight = 1;
-        rig.scenePrePass(0);
-        expectAngle(bone, .8);
-      }
-    },
-  );
-
-  test(
-    'partial weight keeps bind contribution and other-node channels do not consume it',
-    () {
-      final rig = Node(name: 'rig'),
-          bone = Node(name: 'bone'),
-          other = Node(name: 'other');
+  test('two poses blend by weight in either registration order', () {
+    for (final reverse in [false, true]) {
+      final rig = Node(name: 'rig'), bone = Node(name: 'bone');
       rig.add(bone);
-      rig.add(other);
-      final a = rig.createAnimationClip(rotation('a', 'bone', 1.2))
-        ..weight = .25;
-      rig.createAnimationClip(rotation('b', 'other', 1.0)).weight = .75;
+      final angles = reverse ? [1.2, .4] : [.4, 1.2];
+      final a = rig.createAnimationClip(rotation('a', 'bone', angles[0]));
+      final b = rig.createAnimationClip(rotation('b', 'bone', angles[1]));
+      a.weight = reverse ? .3 : .7;
+      b.weight = 1 - a.weight;
       rig.scenePrePass(0);
-      expectAngle(bone, .3);
-      expectAngle(other, .75);
-      a.weight = 0;
+      expectAngle(bone, .4 * .7 + 1.2 * .3);
+      // Overweight clips are normalized by the player.
+      a.weight = b.weight = 1;
       rig.scenePrePass(0);
-      expectAngle(bone, 0);
-    },
-  );
+      expectAngle(bone, .8);
+    }
+  });
+
+  test('a partial weight keeps the rest of the bind pose', () {
+    final rig = Node(name: 'rig'),
+        bone = Node(name: 'bone'),
+        other = Node(name: 'other');
+    rig.add(bone);
+    rig.add(other);
+    final a = rig.createAnimationClip(rotation('a', 'bone', 1.2))..weight = .25;
+    rig.createAnimationClip(rotation('b', 'other', 1.0)).weight = .75;
+    rig.scenePrePass(0);
+    expectAngle(bone, .3);
+    expectAngle(other, .75);
+    a.weight = 0;
+    rig.scenePrePass(0);
+    expectAngle(bone, 0);
+  });
 }

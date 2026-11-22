@@ -167,9 +167,8 @@ class ShadowEncoder {
         }
       }
     }
-    // Recompute for this light/cascade, never reuse the camera's selection.
-    // Each shadow tile submits and flushes synchronously, before another
-    // encoder can reuse RenderItem's per-view instance scratch.
+    // Select instances for this light's volume, not the camera's. The
+    // selection lives on the item, so this encoder's flush must consume it.
     if (!item.cullVisibleInstances(frustum, receiverPlanes)) return;
     _records.add(item);
   }

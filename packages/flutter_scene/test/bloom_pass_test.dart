@@ -9,7 +9,7 @@ import 'package:flutter_scene/src/render/bloom_pass.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('short mobile bloom chain preserves constant input brightness', () {
+  test('a shorter bloom chain keeps its brightness', () {
     for (final levels in [3, 4, 6]) {
       for (final scatter in [0.0, .7, 1.0]) {
         var up = 8000.0;

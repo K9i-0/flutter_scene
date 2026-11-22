@@ -319,15 +319,23 @@ EnvironmentMap buildEnvironmentFromFaces(
   );
 }
 
+/// How many [SkyBakeJob.advance] calls one bake cycle takes.
+int skyBakeStepCount({required bool cube}) =>
+    SkyBakeJob._firstBandStep + kPrefilterBandCount * (cube ? 6 : 1) + 1;
+
+/// The cube face and roughness band the cube layout's prefilter step [index]
+/// runs: all six faces of band 0, then of band 1, and so on.
+({int face, int band}) skyBakeCubePrefilterStep(int index) =>
+    (face: index % 6, band: index ~/ 6);
+
 /// An incremental sky bake: one GPU pass per [advance] call, so a refreshing
 /// sky-driven environment costs a bounded slice per frame instead of a spike.
 ///
 /// A cycle is `6 + 1 + prefilter + 1` steps: the six cube faces, the
 /// equirect assembly, the prefilter (the bulk of the bake's cost), and finally
 /// the SH projection. The prefilter runs one roughness band of one cube face
-/// per step (`6 * kPrefilterBandCount` steps) on the cube layout, or one band
-/// per step on the atlas layout. A whole band of six 512² faces in one frame
-/// stalled a thermally throttled mobile GPU for ~200 ms. The
+/// per step on the cube layout (`6 * kPrefilterBandCount` steps), or one band
+/// per step on the atlas layout. The
 /// outputs are double-buffered: a cycle writes into the atlas/SH pair the
 /// scene is *not* currently sampling, and the finished pair is returned by
 /// the last [advance] for the caller to publish, so a partially-baked
@@ -351,11 +359,11 @@ class SkyBakeJob {
   bool _useCube = false;
 
   // The next step to run, or -1 when idle. Steps: [0..5] faces, [6] equirect,
-  // [7..7+bands) prefilter bands, [7+bands] SH (the final step).
+  // then the prefilter steps, then SH (the final step).
   int _step = -1;
   static const int _equirectStep = 6;
   static const int _firstBandStep = 7;
-  int get _shStep => _firstBandStep + kPrefilterBandCount * (_useCube ? 6 : 1);
+  int get _shStep => skyBakeStepCount(cube: _useCube) - 1;
 
   /// Whether a cycle is in progress.
   bool get inFlight => _step >= 0;
@@ -407,11 +415,12 @@ class SkyBakeJob {
     } else if (step < _shStep) {
       final index = step - _firstBandStep;
       if (_useCube) {
+        final (:face, :band) = skyBakeCubePrefilterStep(index);
         prefilterEquirectRadianceCubeFace(
           _equirect!,
           _atlases[_writeIndex]!,
-          index % 6,
-          index ~/ 6,
+          face,
+          band,
           sourceIsLinear: true,
         );
       } else {

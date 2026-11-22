@@ -19,8 +19,13 @@ final class WebGlContext extends GpuContext {
       alpha: true,
       depth: false,
       stencil: false,
+      powerPreference: 'high-performance',
       preserveDrawingBuffer: true,
     );
+    // Lets a WebXR session bind this context's framebuffers without a later
+    // makeXRCompatible() call, which can lose the context. Ignored by
+    // browsers without WebXR.
+    (attrs as JSObject).setProperty('xrCompatible'.toJS, true.toJS);
     final gl =
         _canvas.getContext('webgl2', attrs) as web.WebGL2RenderingContext?;
     if (gl == null) {
@@ -70,6 +75,70 @@ final class WebGlContext extends GpuContext {
 
   late final web.OffscreenCanvas _canvas;
   late final web.WebGL2RenderingContext _gl;
+
+  final List<_WebGlCompletion> _completions = [];
+  List<CompletionCallback> _unfencedCallbacks = [];
+  Timer? _completionTimer;
+
+  void _enqueueCompletion(CompletionCallback callback) {
+    // Root-zone scheduling keeps a fake clock from capturing the shared poll.
+    if (_unfencedCallbacks.isEmpty) {
+      Zone.root.scheduleMicrotask(_fenceSubmissions);
+    }
+    _unfencedCallbacks.add(Zone.current.bindUnaryCallbackGuarded(callback));
+  }
+
+  void _fenceSubmissions() {
+    final callbacks = _unfencedCallbacks;
+    _unfencedCallbacks = [];
+    // Passes encoded in one turn share a fence after their last command.
+    final sync = _gl.fenceSync(
+      web.WebGL2RenderingContext.SYNC_GPU_COMMANDS_COMPLETE,
+      0,
+    );
+    if (sync == null) {
+      Zone.root.createTimer(Duration.zero, () {
+        for (final callback in callbacks) {
+          callback(CompletionStatus.error);
+        }
+      });
+      return;
+    }
+    _completions.add(_WebGlCompletion(sync, callbacks));
+    _gl.flush();
+    _completionTimer ??= Zone.root.createTimer(Duration.zero, _pollCompletions);
+  }
+
+  void _pollCompletions() {
+    _completionTimer = null;
+    var completed = 0;
+    final ready = <(_WebGlCompletion, CompletionStatus)>[];
+    for (final pending in _completions) {
+      // WebGL 2 sync objects signal only after returning to the event loop.
+      final result = _gl.clientWaitSync(pending.sync, 0, 0);
+      if (result == web.WebGL2RenderingContext.TIMEOUT_EXPIRED) break;
+      _gl.deleteSync(pending.sync);
+      final status =
+          result == web.WebGL2RenderingContext.ALREADY_SIGNALED ||
+              result == web.WebGL2RenderingContext.CONDITION_SATISFIED
+          ? CompletionStatus.successful
+          : CompletionStatus.error;
+      ready.add((pending, status));
+      completed++;
+    }
+    _completions.removeRange(0, completed);
+    for (final (pending, status) in ready) {
+      for (final callback in pending.callbacks) {
+        callback(status);
+      }
+    }
+    if (_completions.isNotEmpty) {
+      _completionTimer ??= Zone.root.createTimer(
+        const Duration(milliseconds: 1),
+        _pollCompletions,
+      );
+    }
+  }
 
   /// Cached vertex-array objects keyed by (pipeline, vertex streams, index
   /// buffer), in least-recently-used order; see WebGlRenderPass._applyVertexState.
@@ -390,6 +459,10 @@ final class WebGlContext extends GpuContext {
       0,
     );
     _gl.bindFramebuffer(web.WebGL2RenderingContext.DRAW_FRAMEBUFFER, null);
+    // The blit runs outside any pass and GL keeps the last pass's scissor and
+    // color mask, so a region copy (one eye of a shared target) would clip it.
+    _gl.disable(web.WebGL2RenderingContext.SCISSOR_TEST);
+    _gl.colorMask(true, true, true, true);
     // Flip vertically during the blit (dst Y runs height -> 0). WebGL2
     // rasterizes into FBO textures bottom-up, so the swapchain texture is
     // stored bottom-up; this flip presents it upright on the canvas. (The
@@ -419,6 +492,14 @@ final class WebGlContext extends GpuContext {
   /// are both synchronous on CanvasKit and Skwasm, so this works inside a
   /// synchronous paint callback - which is what flutter_scene's
   /// `Texture.asImage()` -> `canvas.drawImageRect` path needs.
+  /// Blit [texture] onto the OffscreenCanvas and transfer the result out as
+  /// an `ImageBitmap`, for a consumer outside Flutter (another WebGL context
+  /// that presents it). Synchronous, like [snapshotTextureSync].
+  web.ImageBitmap snapshotTextureBitmap(Texture texture) {
+    _blitTextureToCanvas(texture);
+    return _canvas.transferToImageBitmap();
+  }
+
   ui.Image snapshotTextureSync(Texture texture) {
     _blitTextureToCanvas(texture);
     final bitmap = _canvas.transferToImageBitmap();

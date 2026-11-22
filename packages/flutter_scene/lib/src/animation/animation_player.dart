@@ -148,15 +148,14 @@ class AnimationPlayer {
     }
     double weightMultiplier = totalWeight > 1.0 ? 1.0 / totalWeight : 1.0;
 
-    // Only rotation channels targeting this node consume its bind contribution.
-    // Sequential slerp with raw clip weights leaks the bind pose into a full
-    // crossfade (even two identical 90-degree poses became 67.5 degrees at .5/.5).
-    // Seed cumulative blending with the residual bind weight instead.
+    // Seed each node's rotation blend with the weight its clips leave to the
+    // bind pose, so clips that fully cover a rotation don't blend toward it.
     for (final clip in _clips.values) {
       final weight = clip.weight * weightMultiplier;
       for (final binding in clip._bindings) {
         if (binding.channel.bindTarget.property == AnimationProperty.rotation) {
-          final transforms = _targetTransforms[binding.node]!;
+          final transforms = _targetTransforms[binding.node];
+          if (transforms == null) continue;
           transforms.rotationBlendWeight =
               transforms.rotationBlendWeight! - weight;
         }

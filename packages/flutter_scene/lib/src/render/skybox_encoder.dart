@@ -147,9 +147,9 @@ void _bindFrameInfo(
 Matrix4 skyboxInverseViewProjection(Camera camera, ui.Size dimensions) {
   final viewRotation = camera.getViewMatrix().clone()
     ..setTranslationRaw(0.0, 0.0, 0.0);
-  // The sky is infinitely distant and must not use the water/mirror clipping
-  // plane. Oblique clipping makes far-plane homogeneous w vary per vertex;
-  // dividing by it before interpolation distorts the fullscreen sky rays.
+  // The sky is at infinity, so a mirror's oblique near plane clips none of it.
+  // That plane gives each far corner a different w, which bends the
+  // interpolated view rays.
   var skyProjection = camera.projection;
   while (skyProjection is ObliqueNearClipProjection) {
     skyProjection = skyProjection.base;

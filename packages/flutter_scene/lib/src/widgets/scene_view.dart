@@ -115,7 +115,6 @@ class SceneView extends StatefulWidget {
     this.cameraBuilder,
     this.viewsBuilder,
     this.autoTick = true,
-    this.repaintOnGpuCompletion = true,
     this.pixelRatio,
     this.onTick,
     this.clock,
@@ -165,7 +164,6 @@ class SceneView extends StatefulWidget {
     this.cameraBuilder,
     this.viewsBuilder,
     this.autoTick = true,
-    this.repaintOnGpuCompletion = true,
     this.pixelRatio,
     this.onTick,
     this.clock,
@@ -242,12 +240,6 @@ class SceneView extends StatefulWidget {
   /// animations by the wall time since it last ran, the time spent off
   /// included, unless the app calls [Scene.update] itself.
   final bool autoTick;
-
-  /// Repaint when a GPU-paced frame's outstanding work, or a deferred load,
-  /// completes. Disable when an external repaint driver owns the cadence, so
-  /// a completion cannot bypass its frame cap. The driver must continue
-  /// requesting frames.
-  final bool repaintOnGpuCompletion;
 
   /// Logical-to-physical pixel multiplier for the offscreen render target,
   /// forwarded to [Scene.render]. Defaults to the view's device pixel ratio.
@@ -461,9 +453,6 @@ class _SceneViewState extends State<SceneView>
   // A paced frame's GPU work, or a deferred load, finished. A running ticker
   // paints on its next vsync, with a tick, so only its rate limit is reset.
   void _onRepaintRequested() {
-    // Fork: an external repaint driver owns the cadence and keeps requesting
-    // frames, so a completion must neither repaint nor lift its frame cap.
-    if (!widget.repaintOnGpuCompletion) return;
     if (widget.autoTick && (_ticker?.isTicking ?? false) && _revealed) {
       _frameDue = null;
       return;

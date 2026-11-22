@@ -1,9 +1,6 @@
 ## 0.24.4
 
-* Fork: `PhysicallyBasedMaterial.alphaMaskInShader` makes a masked material test its cutoff in its color shader (eight `StandardMasked*Fragment` variants), so the main pass draws it once.
-* Fork: `SceneView.repaintOnGpuCompletion: false` stops GPU-completion and deferred-load repaints (and the `maxFrameRate` reset they cause), so an external repaint driver retains control of its cadence.
-* Fork: a refreshing `SkyEnvironment` on the cube radiance layout prefilters one face per frame instead of six.
-
+* A refreshing `SkyEnvironment` no longer hitches on the cube radiance layout. Its prefilter splits the heaviest roughness bands across frames, one cube face each.
 * `BloomSettings.levels` sets how many levels the bloom chain blurs through (3 to 6). Fewer levels take fewer passes and give a tighter glow at the same brightness.
 * Crossfading clips no longer dips a node's rotation toward its bind pose.
 * Shadow passes cull the instances of an `InstancedMesh` with `cullInstances` against each light's volume, instead of drawing them all.

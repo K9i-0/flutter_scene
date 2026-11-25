@@ -479,7 +479,7 @@ void main() {
     final plain = texture(width, height);
     final plainTarget = ExternalRenderTarget.texture(plain);
     await render(() => pair(plainTarget));
-    final reference = await _rgbaBytes(plain.asImage());
+    final reference = await _rasterRgbaBytes(plain.asImage());
     final sharedDraws = shadowDraws();
 
     // The same group drawn onto a canvas.
@@ -509,7 +509,7 @@ void main() {
     final List<int> unsharedDraws;
     try {
       await render(() => pair(plainTarget));
-      unshared = await _rgbaBytes(plain.asImage());
+      unshared = await _rasterRgbaBytes(plain.asImage());
       unsharedDraws = shadowDraws();
     } finally {
       debugDisableSharedShadowTiles = false;
@@ -534,7 +534,7 @@ void main() {
     final leasedSpent = leased!.isSpent;
     final surfaceImage = surface.currentImage;
     expect(surfaceImage, isNotNull, reason: 'the surface presented nothing');
-    final leasedPixels = await _rgbaBytes(surfaceImage!);
+    final leasedPixels = await _rasterRgbaBytes(surfaceImage!);
 
     // An eye filling a frame of its own takes the path with no copy.
     final eyeSurface = gpu_shim.gpuContext.createImageSurface(
@@ -552,7 +552,7 @@ void main() {
         ),
       ],
     );
-    final eyePixels = await _rgbaBytes(eyeSurface.currentImage!);
+    final eyePixels = await _rasterRgbaBytes(eyeSurface.currentImage!);
 
     // A call that throws hands the lease back unpresented.
     final abandoned = ExternalRenderTarget.surfaceFrame(
@@ -596,7 +596,7 @@ void main() {
       Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()),
     );
     await FrameCompletion.afterSubmissions().whenGpuDone;
-    final srgbSampled = await _rgbaBytes(sampled.asImage());
+    final srgbSampled = await _rasterRgbaBytes(sampled.asImage());
 
     // A background shows wherever the scene left the target clear.
     const background = Color(0xFF204060);
@@ -606,7 +606,7 @@ void main() {
       backgroundColor: background,
     );
     await render(() => pair(backedTarget));
-    final backedPixels = await _rgbaBytes(backed.asImage());
+    final backedPixels = await _rasterRgbaBytes(backed.asImage());
 
     // The scene covers a small part of each eye, so the differences are
     // taken over the pixels it drew, not diluted by the clear ones.
@@ -1225,6 +1225,123 @@ void main() {
     );
   });
 
+  testWidgets('an unlit Color reaches the screen as its widget value', (
+    tester,
+  ) async {
+    // setBaseColor decodes sRGB to the linear factor. It must come back out
+    // byte-exact wherever the display transform is identity, that is under
+    // linear tone mapping, and on a display-referred surface (which encodes
+    // the linear tint) under any curve.
+    await tester.pumpWidget(
+      const MaterialApp(
+        debugShowCheckedModeBanner: false,
+        home: Scaffold(backgroundColor: kSmokeClear, body: SizedBox.expand()),
+      ),
+    );
+    await tester.pump();
+    await Scene.preload(smaa: true);
+
+    final material = UnlitMaterial()..alphaMode = AlphaMode.opaque;
+    final scene = Scene()..environment = EnvironmentMap.empty();
+    scene.add(
+      Node(mesh: Mesh(CuboidGeometry(vm.Vector3(4, 4, 0.01)), material)),
+    );
+
+    final boundaryKey = GlobalKey();
+    await tester.pumpWidget(
+      MaterialApp(
+        debugShowCheckedModeBanner: false,
+        home: Scaffold(
+          backgroundColor: kSmokeClear,
+          body: Center(
+            child: RepaintBoundary(
+              key: boundaryKey,
+              child: SizedBox(
+                width: kSmokeSize.toDouble(),
+                height: kSmokeSize.toDouble(),
+                child: SceneView(
+                  scene,
+                  camera: PerspectiveCamera(position: vm.Vector3(0, 0, 3)),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final isAndroid =
+        !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+    final frames = isAndroid ? 2 : 10;
+    Future<(int, int, int)> render() async {
+      await _settleGpu();
+      var paced = false;
+      for (var i = 0; i < frames; i++) {
+        paced = await _pumpSettled(
+          tester,
+          scene,
+          const Duration(milliseconds: 50),
+        );
+      }
+      await _capturableFrame(
+        tester,
+        scene,
+        const Duration(milliseconds: 50),
+        paced,
+        null,
+      );
+      final boundary =
+          boundaryKey.currentContext!.findRenderObject()
+              as RenderRepaintBoundary;
+      final ui.Image image = await boundary.toImage(pixelRatio: 1.0);
+      final rgba = (await image.toByteData(
+        format: ui.ImageByteFormat.rawRgba,
+      ))!;
+      final o = ((image.height ~/ 2) * image.width + image.width ~/ 2) * 4;
+      final pixel = (
+        rgba.getUint8(o),
+        rgba.getUint8(o + 1),
+        rgba.getUint8(o + 2),
+      );
+      image.dispose();
+      return pixel;
+    }
+
+    const colors = [Color(0xFFFFFFFF), Color(0xFFC08040), Color(0xFF1B4080)];
+    final cases = <(String, bool, ToneMappingMode)>[
+      ('scene-referred linear', false, ToneMappingMode.linear),
+      ('display-referred pbrNeutral', true, ToneMappingMode.pbrNeutral),
+    ];
+    final mismatches = <String>[];
+    for (final (label, displayReferred, mode) in cases) {
+      material.displayReferred = displayReferred;
+      scene.toneMapping = mode;
+      final row = <String>[];
+      for (final color in colors) {
+        material.setBaseColor(color);
+        final out = await render();
+        final expected = (
+          (color.r * 255).round(),
+          (color.g * 255).round(),
+          (color.b * 255).round(),
+        );
+        row.add('$expected->$out');
+        // One step of slack for the shader's sRGB encode.
+        if ((out.$1 - expected.$1).abs() > 1 ||
+            (out.$2 - expected.$2).abs() > 1 ||
+            (out.$3 - expected.$3).abs() > 1) {
+          mismatches.add('$label $expected gave $out');
+        }
+      }
+      debugPrint('SMOKE unlit_color $label: ${row.join('  ')}');
+    }
+    expect(
+      mismatches,
+      isEmpty,
+      reason: 'a Color set with setBaseColor must reach the screen unchanged',
+    );
+  });
+
   tearDownAll(() {
     binding.reportData = <String, dynamic>{...captures};
   });
@@ -1285,6 +1402,28 @@ _frameStats(ByteData rgba, int w, int h) {
 Future<Uint8List> _rgbaBytes(ui.Image image) async {
   final data = (await image.toByteData(format: ui.ImageByteFormat.rawRgba))!;
   return data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+}
+
+// TODO(gles-readback): use _rgbaBytes once the Flutter floor carries
+// flutter/flutter#195927.
+/// [_rgbaBytes] of [source] drawn into a picture first, so the pixels are
+/// read on the raster thread. On GLES before flutter/flutter#195927, reading
+/// a GPU texture's image directly happens on the IO thread, which can miss the
+/// raster thread's latest draws into it.
+Future<Uint8List> _rasterRgbaBytes(ui.Image source) async {
+  final recorder = ui.PictureRecorder();
+  ui.Canvas(
+    recorder,
+  ).drawImage(source, ui.Offset.zero, ui.Paint()..blendMode = ui.BlendMode.src);
+  final image = await recorder.endRecording().toImage(
+    source.width,
+    source.height,
+  );
+  try {
+    return await _rgbaBytes(image);
+  } finally {
+    image.dispose();
+  }
 }
 
 /// Mean absolute channel difference between two RGBA buffers, in 0..255.
